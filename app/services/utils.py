@@ -109,3 +109,31 @@ def calcular_metricas_membresia(membresia: Optional[Dict[str, Any]]) -> Dict[str
         "fecha_inicio_formateada": formatear_fecha_espanol(membresia.get("fecha_inicio")),
         "fecha_vencimiento_formateada": formatear_fecha_espanol(membresia.get("fecha_vencimiento"))
     }
+
+
+def sugerir_beneficios(nombre_plan: Optional[str]) -> list:
+    """Beneficios sugeridos por nivel de plan para enriquecer la experiencia visual del socio."""
+    n = (nombre_plan or "").lower()
+    if any(k in n for k in ["libre", "total", "vip"]):
+        return [
+            "Acceso ilimitado todos los días y horarios",
+            "Acceso libre a sala de musculación y cardio",
+            "Todas las clases grupales incluidas",
+            "Plan de entrenamiento personalizado y seguimiento",
+            "Acceso a vestuarios y casilleros premium",
+        ]
+    if "premium" in n:
+        return [
+            "Acceso completo de lunes a sábado",
+            "Sala de musculación y máquinas guiadas",
+            "Hasta 3 clases grupales por semana",
+            "Rutina personalizada inicial",
+            "Descuentos en suplementos y merchandising",
+        ]
+    return [
+        "Acceso de lunes a viernes",
+        "Sala de musculación y peso libre",
+        "Evaluación inicial con profesor",
+        "App de seguimiento de asistencias",
+    ]
+

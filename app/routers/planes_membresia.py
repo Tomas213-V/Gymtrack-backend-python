@@ -28,7 +28,7 @@ async def get_planes_membresia(
     )
 
     if estado and estado.lower() != "todos":
-        query = query.eq("estado", estado.lower())
+        query = query.ilike("estado", estado)
 
     res = query.order("id_plan_membresia", desc=False).execute()
     return {"planes": res.data or []}

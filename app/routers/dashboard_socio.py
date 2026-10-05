@@ -16,6 +16,7 @@ from app.services.utils import (
     formatear_precio_ars,
     calcular_metricas_membresia,
     get_data,
+    sugerir_beneficios,
 )
 from app.services.payment_service import (
     crear_preferencia_mercadopago,
@@ -160,7 +161,7 @@ async def get_dashboard_socio(
     # 3. Último pago
     res_pago = (
         supabase.from_("pago")
-        .select("id_pago, monto, fecha_pago, metodo_pago, estado, comprobante, id_membresia")
+        .select("id_pago, monto, fecha_pago, metodo_pago, estado, comprobante, id_membresia, membresia!inner(id_socio)")
         .eq("membresia.id_socio", id_socio)
         .order("fecha_pago", desc=True)
         .limit(1)
@@ -448,11 +449,23 @@ async def get_mi_membresia(current_user: Dict[str, Any] = Depends(get_current_us
             supabase.from_("plan_membresia")
             .select("*")
             .eq("id_gimnasio", socio["id_gimnasio"])
-            .eq("estado", "activo")
             .order("precio", desc=False)
             .execute()
         )
-        planes = res_pl.data or []
+        planes_raw = res_pl.data or []
+        if not planes_raw:
+            planes_semilla = [
+                {"id_gimnasio": socio["id_gimnasio"], "nombre": "Plan Básico", "precio": 15000, "duracion_dias": 30, "estado": "Activo"},
+                {"id_gimnasio": socio["id_gimnasio"], "nombre": "Plan Premium", "precio": 22000, "duracion_dias": 30, "estado": "Activo"},
+                {"id_gimnasio": socio["id_gimnasio"], "nombre": "Pase Libre Total", "precio": 28000, "duracion_dias": 30, "estado": "Activo"}
+            ]
+            try:
+                res_ins = supabase.from_("plan_membresia").insert(planes_semilla).execute()
+                planes_raw = res_ins.data or planes_semilla
+            except Exception:
+                planes_raw = planes_semilla
+
+        planes = [p for p in planes_raw if not p.get("estado") or (p.get("estado") or "").lower() == "activo"]
 
     metricas = calcular_metricas_membresia(membresia)
 
@@ -490,20 +503,86 @@ async def get_mi_membresia(current_user: Dict[str, Any] = Depends(get_current_us
 
 @router.get("/planes-disponibles", status_code=status.HTTP_200_OK)
 async def get_planes_disponibles(current_user: Dict[str, Any] = Depends(get_current_user)):
-    """Obtener planes vigentes para que el socio pueda renovar o cambiar su plan."""
+    """Obtener planes disponibles exclusivos del gimnasio del socio con cálculo de beneficios y upgrades."""
     socio = await obtener_socio_autenticado(current_user)
-    if not socio or not socio.get("id_gimnasio"):
-        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Socio no válido.")
+    if not socio:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Acceso no autorizado. Perfil de socio no encontrado."
+        )
 
-    res = (
+    # 1. Obtener la membresía actual para comparar y clasificar planes superiores
+    res_memb = (
+        supabase.from_("membresia")
+        .select("id_membresia, id_plan_membresia, precio, estado")
+        .eq("id_socio", socio["id_socio"])
+        .order("fecha_vencimiento", desc=True)
+        .limit(1)
+        .maybe_single()
+        .execute()
+    )
+    memb_actual = get_data(res_memb)
+    plan_actual_id = memb_actual.get("id_plan_membresia") if memb_actual else None
+    precio_actual = float(memb_actual.get("precio", 0) or 0) if memb_actual else 0.0
+
+    # 2. Consultar planes de membresía que pertenecen al gimnasio del socio
+    res_planes = (
         supabase.from_("plan_membresia")
         .select("*")
-        .eq("id_gimnasio", socio["id_gimnasio"])
-        .eq("estado", "activo")
+        .eq("id_gimnasio", socio.get("id_gimnasio"))
         .order("precio", desc=False)
         .execute()
     )
-    return {"planes": res.data or []}
+    planes = res_planes.data or []
+
+    # Si el gimnasio aún no tiene planes cargados, sembrar 3 planes predeterminados para dicho gimnasio
+    if not planes and socio.get("id_gimnasio"):
+        planes_semilla = [
+            {"id_gimnasio": socio["id_gimnasio"], "nombre": "Plan Básico", "precio": 15000, "duracion_dias": 30, "estado": "Activo"},
+            {"id_gimnasio": socio["id_gimnasio"], "nombre": "Plan Premium", "precio": 22000, "duracion_dias": 30, "estado": "Activo"},
+            {"id_gimnasio": socio["id_gimnasio"], "nombre": "Pase Libre Total", "precio": 28000, "duracion_dias": 30, "estado": "Activo"}
+        ]
+        try:
+            res_ins = supabase.from_("plan_membresia").insert(planes_semilla).execute()
+            planes = res_ins.data or planes_semilla
+        except Exception:
+            planes = planes_semilla
+
+    # 3. Estructurar y clasificar planes para el frontend
+    planes_formateados = []
+    for plan in (planes or []):
+        est = (plan.get("estado") or "").lower()
+        if est and est != "activo":
+            continue
+
+        precio_num = float(plan.get("precio", 0) or 0)
+        duracion = plan.get("duracion_dias", 30) or 30
+        es_plan_actual = plan.get("id_plan_membresia") == plan_actual_id
+        es_superior = (not es_plan_actual) and (precio_num > precio_actual)
+        diferencia = precio_num - precio_actual
+
+        planes_formateados.append({
+            "id_plan_membresia": plan.get("id_plan_membresia"),
+            "id_gimnasio": plan.get("id_gimnasio"),
+            "nombre": plan.get("nombre"),
+            "precio": precio_num,
+            "precio_formateado": formatear_precio_ars(precio_num),
+            "duracion_dias": duracion,
+            "duracion_texto": f"{duracion} días",
+            "estado": plan.get("estado"),
+            "es_plan_actual": es_plan_actual,
+            "es_superior": es_superior,
+            "diferencia_precio": diferencia if diferencia > 0 else 0,
+            "diferencia_precio_formateada": formatear_precio_ars(diferencia) if diferencia > 0 else None,
+            "beneficios": sugerir_beneficios(plan.get("nombre")),
+        })
+
+    return {
+        "gimnasio_id": socio.get("id_gimnasio"),
+        "plan_actual_id": plan_actual_id,
+        "total_planes": len(planes_formateados),
+        "planes": planes_formateados,
+    }
 
 
 @router.post("/membresia/actualizar", status_code=status.HTTP_200_OK)
