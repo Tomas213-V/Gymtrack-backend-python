@@ -197,6 +197,7 @@ async def login_socio(req: LoginSocioRequest):
 
     clean_email = req.email.strip().lower()
     clean_dni = str(req.dni).strip()
+    print(f"INFO:     [AUTH] Intento de login socio: email='{clean_email}', dni='{clean_dni}'")
 
     # 1. Buscar al socio
     res = (
@@ -210,18 +211,21 @@ async def login_socio(req: LoginSocioRequest):
     socio = get_data(res)
 
     if not socio:
+        print(f"WARNING:  [AUTH] Socio no encontrado con email='{clean_email}' y dni='{clean_dni}'")
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
             detail="Credenciales inválidas. Verifique su correo electrónico y DNI."
         )
 
     if (socio.get("estado") or "").lower() != "activo":
+        print(f"WARNING:  [AUTH] Socio '{clean_email}' inactivo (estado='{socio.get('estado')}')")
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,
             detail="El socio se encuentra inactivo. Comuníquese con la administración del gimnasio."
         )
 
     if not socio.get("contrasena"):
+        print(f"WARNING:  [AUTH] Socio '{clean_email}' sin contraseña asignada en la BD.")
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
             detail="Este socio aún no tiene una contraseña asignada. Solicite su registro en el gimnasio."
@@ -229,10 +233,13 @@ async def login_socio(req: LoginSocioRequest):
 
     # 2. Validar contraseña
     if not verify_password(password_input, socio.get("contrasena")):
+        print(f"WARNING:  [AUTH] Contraseña incorrecta para socio '{clean_email}'")
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
             detail="Credenciales inválidas. Contraseña incorrecta."
         )
+
+    print(f"INFO:     [AUTH] Login exitoso para socio '{clean_email}' (id_socio={socio['id_socio']})")
 
     # 3. Obtener datos del gimnasio
     gimnasio = None

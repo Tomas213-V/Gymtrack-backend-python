@@ -4,7 +4,9 @@
 
 from datetime import datetime, timezone
 import uvicorn
-from fastapi import FastAPI, status, Response
+from fastapi import FastAPI, status, Response, Request
+from fastapi.exceptions import RequestValidationError
+from starlette.exceptions import HTTPException as StarletteHTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 
@@ -39,6 +41,33 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+
+@app.exception_handler(StarletteHTTPException)
+async def custom_http_exception_handler(request: Request, exc: StarletteHTTPException):
+    detail = exc.detail
+    return JSONResponse(
+        status_code=exc.status_code,
+        content={
+            "detail": detail,
+            "error": detail if isinstance(detail, str) else str(detail),
+        },
+        headers=getattr(exc, "headers", None),
+    )
+
+
+@app.exception_handler(RequestValidationError)
+async def validation_exception_handler(request: Request, exc: RequestValidationError):
+    first_msg = "Error de validación en la solicitud."
+    if exc.errors():
+        first_msg = exc.errors()[0].get("msg", first_msg)
+    return JSONResponse(
+        status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+        content={
+            "detail": exc.errors(),
+            "error": first_msg,
+        },
+    )
 
 # 3. RUTAS DE PRUEBA Y SALUD
 
