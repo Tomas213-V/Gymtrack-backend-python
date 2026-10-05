@@ -3,6 +3,7 @@ from typing import Dict, Any, Optional
 from fastapi import APIRouter, HTTPException, status, Depends, Query, Path
 from app.config import supabase
 from app.core.dependencies import get_current_user
+from app.services.utils import get_data
 from app.models.pago import PagoCreate, PagoUpdateEstado
 
 router = APIRouter(prefix="/api/pagos", tags=["Pagos"])
@@ -201,10 +202,11 @@ async def get_pago_by_id(id: int = Path(...)):
         .execute()
     )
 
-    if not res.data:
+    pago = get_data(res)
+    if not pago:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Pago no encontrado.")
 
-    return res.data
+    return pago
 
 
 @router.post("", status_code=status.HTTP_201_CREATED)
@@ -258,8 +260,9 @@ async def registrar_pago(
             .maybe_single()
             .execute()
         )
-        if res_mex.data:
-            id_membresia = res_mex.data["id_membresia"]
+        mex_data = get_data(res_mex)
+        if mex_data:
+            id_membresia = mex_data["id_membresia"]
         else:
             plan_id = req.id_plan_membresia
             duracion_dias = 30
@@ -271,22 +274,25 @@ async def registrar_pago(
                     .maybe_single()
                     .execute()
                 )
-                if res_p.data and res_p.data.get("duracion_dias"):
-                    duracion_dias = res_p.data["duracion_dias"]
+                p_data = get_data(res_p)
+                if p_data and p_data.get("duracion_dias"):
+                    duracion_dias = p_data["duracion_dias"]
             elif req.plan:
                 pq = supabase.from_("plan_membresia").select("id_plan_membresia, duracion_dias").ilike("nombre", f"%{req.plan}%")
                 if gym_id:
                     pq = pq.eq("id_gimnasio", gym_id)
                 res_pf = pq.limit(1).maybe_single().execute()
-                if res_pf.data:
-                    plan_id = res_pf.data["id_plan_membresia"]
-                    duracion_dias = res_pf.data.get("duracion_dias") or 30
+                pf_data = get_data(res_pf)
+                if pf_data:
+                    plan_id = pf_data["id_plan_membresia"]
+                    duracion_dias = pf_data.get("duracion_dias") or 30
 
             if not plan_id and gym_id:
                 res_pdef = supabase.from_("plan_membresia").select("id_plan_membresia, duracion_dias").eq("id_gimnasio", gym_id).limit(1).maybe_single().execute()
-                if res_pdef.data:
-                    plan_id = res_pdef.data["id_plan_membresia"]
-                    duracion_dias = res_pdef.data.get("duracion_dias") or 30
+                pdef_data = get_data(res_pdef)
+                if pdef_data:
+                    plan_id = pdef_data["id_plan_membresia"]
+                    duracion_dias = pdef_data.get("duracion_dias") or 30
                 else:
                     res_pn = supabase.from_("plan_membresia").insert([{
                         "id_gimnasio": int(gym_id),

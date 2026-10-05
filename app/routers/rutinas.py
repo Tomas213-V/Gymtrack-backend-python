@@ -2,6 +2,7 @@ from datetime import date
 from typing import Optional
 from fastapi import APIRouter, HTTPException, status, Query, Path
 from app.config import supabase
+from app.services.utils import get_data
 from app.models.rutina import (
     RutinaCreate,
     RutinaUpdate,
@@ -115,7 +116,7 @@ async def get_rutina_by_id(id: int = Path(...)):
         .execute()
     )
 
-    data = res.data
+    data = get_data(res)
     if not data:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,

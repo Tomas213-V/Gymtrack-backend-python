@@ -3,6 +3,7 @@ from typing import Dict, Any, Optional
 from fastapi import APIRouter, HTTPException, status, Depends, Query, Path
 from app.config import supabase
 from app.core.dependencies import get_current_user
+from app.services.utils import get_data
 from app.models.membresia import MembresiaCreate, MembresiaUpdate
 
 router = APIRouter(prefix="/api/membresias", tags=["Membresías"])
@@ -74,13 +75,14 @@ async def get_membresia_by_id(
         .execute()
     )
 
-    if not res.data:
+    memb = get_data(res)
+    if not memb:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
             detail="Membresía no encontrada o no pertenece a tu gimnasio."
         )
 
-    return {"membresia": res.data}
+    return {"membresia": memb}
 
 
 @router.post("", status_code=status.HTTP_201_CREATED)
@@ -100,7 +102,7 @@ async def create_membresia(
         .maybe_single()
         .execute()
     )
-    if not res_socio.data:
+    if not get_data(res_socio):
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
             detail="El socio especificado no existe o no pertenece a tu gimnasio."
@@ -115,7 +117,7 @@ async def create_membresia(
         .maybe_single()
         .execute()
     )
-    plan = res_plan.data
+    plan = get_data(res_plan)
     if not plan:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
@@ -179,7 +181,7 @@ async def update_membresia(
         .maybe_single()
         .execute()
     )
-    memb_actual = res_m.data
+    memb_actual = get_data(res_m)
     if not memb_actual:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,

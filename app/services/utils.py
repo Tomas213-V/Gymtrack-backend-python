@@ -4,6 +4,15 @@ from typing import Optional, Dict, Any
 MESES_ES = ['Ene', 'Feb', 'Mar', 'Abr', 'May', 'Jun', 'Jul', 'Ago', 'Sep', 'Oct', 'Nov', 'Dic']
 
 
+def get_data(res: Any) -> Any:
+    """Extrae .data de una respuesta de Supabase de manera segura, retornando None si res es None."""
+    if res is None:
+        return None
+    if hasattr(res, "data"):
+        return res.data
+    return None
+
+
 def formatear_fecha_espanol(fecha_str: Optional[str]) -> str:
     """Formatea una fecha 'YYYY-MM-DD' o ISO a formato amigable: '15 Dic 2026'."""
     if not fecha_str:
@@ -81,7 +90,7 @@ def calcular_metricas_membresia(membresia: Optional[Dict[str, Any]]) -> Dict[str
 
     if esta_vencida or estado_clave in ("vencido", "vencida"):
         estado_clave = "vencida"
-        estadoEtiqueta = "Vencida"
+        estado_etiqueta = "Vencida"
     elif estado_clave == "pendiente":
         estado_etiqueta = "Pendiente de Pago"
     elif estado_clave in ("activo", "activa"):
@@ -95,7 +104,7 @@ def calcular_metricas_membresia(membresia: Optional[Dict[str, Any]]) -> Dict[str
         "dias_restantes": max(0, dias_restantes),
         "dias_reales": dias_restantes,
         "tiempo_restante_texto": tiempo_restante_texto,
-        "porcentaje_transcurrido": porcentajeTranscurrido,
+        "porcentaje_transcurrido": porcentaje_transcurrido,
         "esta_vencida": esta_vencida,
         "fecha_inicio_formateada": formatear_fecha_espanol(membresia.get("fecha_inicio")),
         "fecha_vencimiento_formateada": formatear_fecha_espanol(membresia.get("fecha_vencimiento"))

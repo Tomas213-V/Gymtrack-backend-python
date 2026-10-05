@@ -8,6 +8,7 @@ from app.core.security import (
     create_access_token,
 )
 from app.core.dependencies import get_current_user
+from app.services.utils import get_data
 from app.models.auth import (
     RegisterOwnerRequest,
     LoginRequest,
@@ -30,7 +31,7 @@ async def register_owner(req: RegisterOwnerRequest):
         .maybe_single()
         .execute()
     )
-    if res_existente.data:
+    if get_data(res_existente):
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
             detail="El email ingresado ya está registrado."
@@ -126,7 +127,7 @@ async def login(req: LoginRequest):
         .maybe_single()
         .execute()
     )
-    usuario = res.data
+    usuario = get_data(res)
 
     if not usuario:
         raise HTTPException(
@@ -155,7 +156,7 @@ async def login(req: LoginRequest):
         .maybe_single()
         .execute()
     )
-    gimnasio = res_gym.data
+    gimnasio = get_data(res_gym)
 
     # 4. Generar token
     token_payload = {
@@ -206,7 +207,7 @@ async def login_socio(req: LoginSocioRequest):
         .maybe_single()
         .execute()
     )
-    socio = res.data
+    socio = get_data(res)
 
     if not socio:
         raise HTTPException(
@@ -243,7 +244,7 @@ async def login_socio(req: LoginSocioRequest):
             .maybe_single()
             .execute()
         )
-        gimnasio = res_gym.data
+        gimnasio = get_data(res_gym)
 
     # 4. Generar token
     token_payload = {
@@ -297,7 +298,7 @@ async def get_me(usuario_auth: Dict[str, Any] = Depends(get_current_user)):
             .maybe_single()
             .execute()
         )
-        socio = res_s.data
+        socio = get_data(res_s)
         if not socio:
             raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Socio no encontrado.")
 
@@ -310,7 +311,7 @@ async def get_me(usuario_auth: Dict[str, Any] = Depends(get_current_user)):
                 .maybe_single()
                 .execute()
             )
-            gimnasio = res_g.data
+            gimnasio = get_data(res_g)
 
         socio_resp = dict(socio)
         socio_resp["rol"] = "socio"
@@ -325,7 +326,7 @@ async def get_me(usuario_auth: Dict[str, Any] = Depends(get_current_user)):
         .maybe_single()
         .execute()
     )
-    usuario = res_u.data
+    usuario = get_data(res_u)
     if not usuario:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Usuario no encontrado.")
 
@@ -337,5 +338,5 @@ async def get_me(usuario_auth: Dict[str, Any] = Depends(get_current_user)):
         .execute()
     )
     user_resp = dict(usuario)
-    user_resp["gimnasio"] = res_gym.data or None
+    user_resp["gimnasio"] = get_data(res_gym)
     return {"usuario": user_resp}

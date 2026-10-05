@@ -1,6 +1,7 @@
 from typing import Optional
 from fastapi import APIRouter, HTTPException, status, Query, Path
 from app.config import supabase
+from app.services.utils import get_data
 from app.models.ejercicio import EjercicioCreate, EjercicioUpdate
 
 router = APIRouter(prefix="/api/ejercicios", tags=["Ejercicios"])
@@ -36,10 +37,11 @@ async def get_ejercicios(
 async def get_ejercicio_by_id(id: int = Path(...)):
     """Obtener un ejercicio por ID."""
     res = supabase.from_("ejercicio").select("*").eq("id_ejercicio", id).maybe_single().execute()
-    if not res.data:
+    data = get_data(res)
+    if not data:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Ejercicio no encontrado.")
 
-    return res.data
+    return data
 
 
 @router.post("", status_code=status.HTTP_201_CREATED)

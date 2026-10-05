@@ -5,6 +5,7 @@ from fastapi import APIRouter, HTTPException, status, Depends, Query, Path
 from app.config import supabase
 from app.core.dependencies import get_current_user
 from app.core.security import get_password_hash, verify_password
+from app.services.utils import get_data
 from app.models.socio import (
     SocioCreate,
     SocioUpdate,
@@ -52,7 +53,7 @@ async def get_perfil_socio(
         .maybe_single()
         .execute()
     )
-    socio = res.data
+    socio = get_data(res)
 
     if not socio:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Socio no encontrado.")
@@ -175,7 +176,7 @@ async def update_perfil_socio(
         .maybe_single()
         .execute()
     )
-    socio_actual = res_fetch.data
+    socio_actual = get_data(res_fetch)
     if not socio_actual:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Socio no encontrado.")
 
@@ -219,7 +220,7 @@ async def update_perfil_socio(
             .maybe_single()
             .execute()
         )
-        if res_dni.data:
+        if get_data(res_dni):
             raise HTTPException(
                 status_code=status.HTTP_400_BAD_REQUEST,
                 detail="El DNI ingresado ya está asignado a otro socio en este gimnasio."
@@ -347,7 +348,7 @@ async def get_socio_by_id(
         query = query.eq("id_gimnasio", id_gimnasio)
 
     res = query.maybe_single().execute()
-    socio = res.data
+    socio = get_data(res)
 
     if not socio:
         raise HTTPException(
@@ -390,7 +391,7 @@ async def create_socio(
         .maybe_single()
         .execute()
     )
-    if res_exist.data:
+    if get_data(res_exist):
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
             detail="Ya existe un socio registrado con este DNI."
@@ -436,11 +437,12 @@ async def create_socio(
                 .maybe_single()
                 .execute()
             )
-            if res_p.data:
-                plan_id = res_p.data["id_plan_membresia"]
-                plan_duracion = res_p.data.get("duracion_dias") or 30
+            p_data = get_data(res_p)
+            if p_data:
+                plan_id = p_data["id_plan_membresia"]
+                plan_duracion = p_data.get("duracion_dias") or 30
                 if plan_precio is None:
-                    plan_precio = res_p.data.get("precio")
+                    plan_precio = p_data.get("precio")
 
         if not plan_id:
             res_def = (
@@ -451,11 +453,12 @@ async def create_socio(
                 .maybe_single()
                 .execute()
             )
-            if res_def.data:
-                plan_id = res_def.data["id_plan_membresia"]
-                plan_duracion = res_def.data.get("duracion_dias") or 30
+            def_data = get_data(res_def)
+            if def_data:
+                plan_id = def_data["id_plan_membresia"]
+                plan_duracion = def_data.get("duracion_dias") or 30
                 if plan_precio is None:
-                    plan_precio = res_def.data.get("precio")
+                    plan_precio = def_data.get("precio")
 
         f_inicio = date.today().isoformat()
         f_venc = req.fecha_vencimiento or (date.today() + timedelta(days=plan_duracion)).isoformat()
@@ -503,7 +506,7 @@ async def update_socio(
         query = query.eq("id_gimnasio", id_gimnasio)
 
     res_check = query.maybe_single().execute()
-    if not res_check.data:
+    if not get_data(res_check):
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Socio no encontrado o sin permisos.")
 
     raw_pass = req.contrasena or req.password
@@ -552,18 +555,20 @@ async def update_socio(
                 .maybe_single()
                 .execute()
             )
-            if res_p.data:
-                duracion_dias = res_p.data.get("duracion_dias") or 30
-                plan_precio = res_p.data.get("precio")
+            p_data = get_data(res_p)
+            if p_data:
+                duracion_dias = p_data.get("duracion_dias") or 30
+                plan_precio = p_data.get("precio")
         elif req.plan:
             pq = supabase.from_("plan_membresia").select("id_plan_membresia, duracion_dias, precio").ilike("nombre", f"%{req.plan}%")
             if id_gimnasio:
                 pq = pq.eq("id_gimnasio", id_gimnasio)
             res_pf = pq.limit(1).maybe_single().execute()
-            if res_pf.data:
-                plan_id = res_pf.data["id_plan_membresia"]
-                duracion_dias = res_pf.data.get("duracion_dias") or 30
-                plan_precio = res_pf.data.get("precio")
+            pf_data = get_data(res_pf)
+            if pf_data:
+                plan_id = pf_data["id_plan_membresia"]
+                duracion_dias = pf_data.get("duracion_dias") or 30
+                plan_precio = pf_data.get("precio")
 
         res_mex = (
             supabase.from_("membresia")
@@ -573,14 +578,15 @@ async def update_socio(
             .maybe_single()
             .execute()
         )
-        if res_mex.data:
+        mex_data = get_data(res_mex)
+        if mex_data:
             m_upd = {}
             if plan_id:
                 m_upd["id_plan_membresia"] = plan_id
             if plan_precio is not None:
                 m_upd["precio"] = plan_precio
             if m_upd:
-                supabase.from_("membresia").update(m_upd).eq("id_membresia", res_mex.data["id_membresia"]).execute()
+                supabase.from_("membresia").update(m_upd).eq("id_membresia", mex_data["id_membresia"]).execute()
         elif plan_id:
             supabase.from_("membresia").insert([{
                 "id_socio": id,
@@ -643,7 +649,7 @@ async def delete_socio(
         query = query.eq("id_gimnasio", id_gimnasio)
 
     res = query.maybe_single().execute()
-    if not res.data:
+    if not get_data(res):
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Socio no encontrado o sin permisos.")
 
     # 1. Eliminar pagos y membresías

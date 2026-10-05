@@ -4,6 +4,7 @@ import math
 from fastapi import APIRouter, HTTPException, status, Depends, Query, Path
 from app.config import supabase
 from app.core.dependencies import get_optional_user
+from app.services.utils import get_data
 from app.models.asistencia import AsistenciaCreate, AsistenciaCheckout
 
 router = APIRouter(prefix="/api/asistencias", tags=["Asistencias"])
@@ -156,7 +157,7 @@ async def get_asistencias(
 
     if search and search.strip():
         s = search.strip()
-        query = query.or_(f"nombre.ilike.%{s}%,apellido.ilike.%{s}%,dni.ilike.%{s}%", foreign_table="socio")
+        query = query.or_(f"nombre.ilike.%{s}%,apellido.ilike.%{s}%,dni.ilike.%{s}%", reference_table="socio")
 
     query = query.order("hora_ingreso", desc=True).range(offset, offset + limit - 1)
     res = query.execute()
@@ -214,7 +215,7 @@ async def registrar_asistencia(
         socio_query = socio_query.eq("id_gimnasio", gym_id)
 
     res_socio = socio_query.maybe_single().execute()
-    socio = res_socio.data
+    socio = get_data(res_socio)
 
     if not socio:
         raise HTTPException(
@@ -260,7 +261,7 @@ async def checkout_asistencia(
         query = query.eq("socio.id_gimnasio", gym_id)
 
     res = query.maybe_single().execute()
-    asistencia = res.data
+    asistencia = get_data(res)
 
     if not asistencia:
         raise HTTPException(

@@ -1,4 +1,4 @@
-from typing import Optional
+from typing import Optional, Any
 from pydantic import BaseModel, EmailStr, Field
 
 
@@ -14,13 +14,13 @@ class RegisterOwnerRequest(BaseModel):
 
 
 class LoginRequest(BaseModel):
-    email: str
+    email: Optional[str] = None
     contrasena: Optional[str] = None
     password: Optional[str] = None
 
 
 class LoginSocioRequest(BaseModel):
-    email: str
-    dni: str
+    email: Optional[str] = None
+    dni: Optional[Any] = None
     contrasena: Optional[str] = None
     password: Optional[str] = None

@@ -15,6 +15,7 @@ from app.services.utils import (
     formatear_fecha_espanol,
     formatear_precio_ars,
     calcular_metricas_membresia,
+    get_data,
 )
 from app.services.payment_service import (
     crear_preferencia_mercadopago,
@@ -43,8 +44,9 @@ async def resolver_id_socio(current_user: Dict[str, Any], query_id: Optional[int
             .maybe_single()
             .execute()
         )
-        if res.data:
-            return int(res.data["id_socio"])
+        socio_data = get_data(res)
+        if socio_data:
+            return int(socio_data["id_socio"])
 
     if query_id and current_user.get("rol") in ("dueño", "administrador"):
         return int(query_id)
@@ -65,7 +67,7 @@ async def obtener_socio_autenticado(current_user: Dict[str, Any]) -> Optional[Di
         .maybe_single()
         .execute()
     )
-    return res.data
+    return get_data(res)
 
 
 # ==============================================================================
@@ -126,7 +128,7 @@ async def get_dashboard_socio(
         .maybe_single()
         .execute()
     )
-    socio = res_socio.data
+    socio = get_data(res_socio)
     if not socio:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="No se encontraron datos del socio en el sistema.")
 
@@ -153,7 +155,7 @@ async def get_dashboard_socio(
         .maybe_single()
         .execute()
     )
-    membresia = res_memb.data
+    membresia = get_data(res_memb)
 
     # 3. Último pago
     res_pago = (
@@ -165,7 +167,7 @@ async def get_dashboard_socio(
         .maybe_single()
         .execute()
     )
-    ultimo_pago = res_pago.data
+    ultimo_pago = get_data(res_pago)
 
     # 4. Progresos
     res_prog_ultimo = (
@@ -177,7 +179,7 @@ async def get_dashboard_socio(
         .maybe_single()
         .execute()
     )
-    ultimo_progreso = res_prog_ultimo.data
+    ultimo_progreso = get_data(res_prog_ultimo)
 
     res_prog_hist = (
         supabase.from_("progreso")
@@ -242,7 +244,7 @@ async def get_dashboard_socio(
         .maybe_single()
         .execute()
     )
-    rutina_activa = res_rutina.data
+    rutina_activa = get_data(res_rutina)
 
     # Métricas membresía
     dias_restantes = None
@@ -418,7 +420,7 @@ async def get_mi_membresia(current_user: Dict[str, Any] = Depends(get_current_us
         .maybe_single()
         .execute()
     )
-    membresia = res_m.data
+    membresia = get_data(res_m)
 
     # 2. Historial de pagos
     res_pagos = (
@@ -525,7 +527,7 @@ async def solicitar_actualizacion(
         .maybe_single()
         .execute()
     )
-    plan = res_plan.data
+    plan = get_data(res_plan)
     if not plan:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="El plan seleccionado no existe.")
 
@@ -543,7 +545,7 @@ async def solicitar_actualizacion(
         .maybe_single()
         .execute()
     )
-    memb_actual = res_m.data
+    memb_actual = get_data(res_m)
 
     f_inicio = hoy
     if memb_actual and memb_actual.get("fecha_vencimiento"):
@@ -618,7 +620,7 @@ async def iniciar_pago(
         .maybe_single()
         .execute()
     )
-    plan = res_plan.data
+    plan = get_data(res_plan)
     if not plan:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Plan de membresía no encontrado.")
 
@@ -630,7 +632,7 @@ async def iniciar_pago(
         .maybe_single()
         .execute()
     )
-    gym = res_gym.data
+    gym = get_data(res_gym)
 
     meses = req.meses or 1
     monto_total = float(plan.get("precio", 0)) * meses
@@ -681,7 +683,7 @@ async def confirmar_pago(
             .maybe_single()
             .execute()
         )
-        plan = res_p.data
+        plan = get_data(res_p)
 
     monto = float(req.monto) if req.monto is not None else (float(plan.get("precio", 0)) if plan else 0.0)
     duracion_dias = int(plan.get("duracion_dias", 30)) if plan else 30
@@ -697,7 +699,7 @@ async def confirmar_pago(
         .maybe_single()
         .execute()
     )
-    memb_actual = res_m.data
+    memb_actual = get_data(res_m)
 
     f_inicio = hoy
     f_venc = hoy + timedelta(days=duracion_dias)
@@ -832,12 +834,13 @@ async def verificar_pago_mercadopago(
         .maybe_single()
         .execute()
     )
-    if res_exist.data:
+    exist_data = get_data(res_exist)
+    if exist_data:
         return {
             "aprobado": True,
             "ya_registrado": True,
             "mensaje": "El pago ya se encuentra registrado y acreditado en GymTrack.",
-            "pago_id": res_exist.data["id_pago"],
+            "pago_id": exist_data["id_pago"],
         }
 
     # Extraer ID de plan
@@ -850,7 +853,7 @@ async def verificar_pago_mercadopago(
     plan = None
     if plan_id:
         res_p = supabase.from_("plan_membresia").select("*").eq("id_plan_membresia", plan_id).maybe_single().execute()
-        plan = res_p.data
+        plan = get_data(res_p)
 
     monto_final = float(pago_encontrado.get("transaction_amount") or (plan.get("precio", 0) if plan else 0))
     duracion_dias = int(plan.get("duracion_dias", 30)) if plan else 30
@@ -866,7 +869,7 @@ async def verificar_pago_mercadopago(
         .maybe_single()
         .execute()
     )
-    memb_actual = res_m.data
+    memb_actual = get_data(res_m)
 
     f_inicio = hoy
     f_venc = hoy + timedelta(days=duracion_dias)

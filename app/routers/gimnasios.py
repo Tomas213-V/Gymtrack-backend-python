@@ -3,6 +3,7 @@ from typing import Dict, Any, Optional
 from fastapi import APIRouter, HTTPException, status, Depends, Query
 from app.config import supabase
 from app.core.dependencies import get_current_user
+from app.services.utils import get_data
 from app.models.gimnasio import GimnasioCreate
 
 router = APIRouter(prefix="/api/gimnasios", tags=["Gimnasios"])
@@ -35,8 +36,8 @@ async def crear_gimnasio(
         .maybe_single()
         .execute()
     )
-    if res_exist.data:
-        return HTTPException(
+    if get_data(res_exist):
+        raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
             detail="El usuario ya tiene un gimnasio registrado."
         )
@@ -85,7 +86,7 @@ async def obtener_mi_gimnasio(
         .execute()
     )
 
-    gimnasio = res.data
+    gimnasio = get_data(res)
     return {
         "tieneGimnasio": bool(gimnasio),
         "gimnasio": gimnasio or None,

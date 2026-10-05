@@ -2,6 +2,7 @@ from typing import Dict, Any, Optional
 from fastapi import APIRouter, HTTPException, status, Depends, Query, Path
 from app.config import supabase
 from app.core.dependencies import get_current_user
+from app.services.utils import get_data
 from app.models.plan_membresia import PlanMembresiaCreate, PlanMembresiaUpdate
 
 router = APIRouter(prefix="/api/planes-membresia", tags=["Planes de Membresía"])
@@ -48,7 +49,7 @@ async def get_plan_membresia_by_id(
         .maybe_single()
         .execute()
     )
-    plan = res.data
+    plan = get_data(res)
     if not plan:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
