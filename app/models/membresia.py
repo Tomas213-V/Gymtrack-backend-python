@@ -12,8 +12,10 @@ class MembresiaCreate(BaseModel):
 
 
 class MembresiaUpdate(BaseModel):
+    id_plan_membresia: Optional[int] = None
     estado: Optional[str] = None
     fecha_inicio: Optional[str] = None
     fecha_vencimiento: Optional[str] = None
     dias_extension: Optional[int] = None
     precio: Optional[float] = None
+

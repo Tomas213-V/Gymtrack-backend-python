@@ -189,6 +189,9 @@ async def update_membresia(
         )
 
     update_payload = {}
+    if req.id_plan_membresia:
+        update_payload["id_plan_membresia"] = req.id_plan_membresia
+
     if req.fecha_inicio:
         update_payload["fecha_inicio"] = req.fecha_inicio.split("T")[0]
 
@@ -227,3 +230,48 @@ async def update_membresia(
         "mensaje": "Membresía actualizada exitosamente.",
         "membresia": res_full.data,
     }
+
+
+@router.delete("/{id}", status_code=status.HTTP_200_OK)
+async def delete_membresia(
+    id: int = Path(...),
+    current_user: Dict[str, Any] = Depends(get_current_user),
+):
+    """Eliminar o cancelar una membresía."""
+    id_gimnasio = current_user.get("id_gimnasio")
+    if not id_gimnasio:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="No se identificó el gimnasio autenticado.",
+        )
+
+    # Verificar que la membresía exista y pertenezca al gimnasio
+    res_m = (
+        supabase.from_("membresia")
+        .select("id_membresia, socio!inner(id_gimnasio)")
+        .eq("id_membresia", id)
+        .eq("socio.id_gimnasio", id_gimnasio)
+        .maybe_single()
+        .execute()
+    )
+    memb_actual = get_data(res_m)
+    if not memb_actual:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Membresía no encontrada o no pertenece a tu gimnasio.",
+        )
+
+    try:
+        supabase.from_("membresia").delete().eq("id_membresia", id).execute()
+    except Exception as exc:
+        msg = str(exc).lower()
+        if "foreign key" in msg or "violates" in msg or "23503" in msg:
+            supabase.from_("membresia").update({"estado": "cancelada"}).eq("id_membresia", id).execute()
+            return {
+                "mensaje": "La membresía tiene pagos u operaciones registradas en el historial contable. Se ha marcado como cancelada.",
+                "cancelada": True,
+            }
+        raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail=f"Error al eliminar la membresía: {exc}")
+
+    return {"mensaje": "Membresía eliminada exitosamente."}
+

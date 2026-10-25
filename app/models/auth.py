@@ -24,3 +24,11 @@ class LoginSocioRequest(BaseModel):
     dni: Optional[Any] = None
     contrasena: Optional[str] = None
     password: Optional[str] = None
+
+
+class UpdateOwnerProfileRequest(BaseModel):
+    nombre: Optional[str] = None
+    apellido: Optional[str] = None
+    email: Optional[str] = None
+    contrasena_actual: Optional[str] = None
+    nueva_contrasena: Optional[str] = None

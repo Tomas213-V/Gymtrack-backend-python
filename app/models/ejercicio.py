@@ -7,6 +7,17 @@ class EjercicioCreate(BaseModel):
     grupo_muscular: Optional[str] = None
     descripcion: Optional[str] = None
     dificultad: Optional[str] = None
+    id_socio: Optional[int] = None
+    id_gimnasio: Optional[int] = None
+
+
+class EjercicioPersonalizadoCreate(BaseModel):
+    nombre: str
+    grupo_muscular: Optional[str] = None
+    descripcion: Optional[str] = None
+    dificultad: Optional[str] = None
+    id_socio: Optional[int] = None
+    id_gimnasio: Optional[int] = None
 
 
 class EjercicioUpdate(BaseModel):
@@ -14,3 +25,4 @@ class EjercicioUpdate(BaseModel):
     grupo_muscular: Optional[str] = None
     descripcion: Optional[str] = None
     dificultad: Optional[str] = None
+

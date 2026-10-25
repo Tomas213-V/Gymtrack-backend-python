@@ -1,5 +1,6 @@
+import re
 from datetime import datetime, timezone
-from typing import Dict, Any
+from typing import Dict, Any, Optional
 from fastapi import APIRouter, HTTPException, status, Depends
 from app.config import supabase
 from app.core.security import (
@@ -13,6 +14,7 @@ from app.models.auth import (
     RegisterOwnerRequest,
     LoginRequest,
     LoginSocioRequest,
+    UpdateOwnerProfileRequest,
 )
 
 router = APIRouter(prefix="/api/auth", tags=["Autenticación"])
@@ -339,11 +341,134 @@ async def get_me(usuario_auth: Dict[str, Any] = Depends(get_current_user)):
 
     res_gym = (
         supabase.from_("gimnasio")
-        .select("id_gimnasio, nombre, direccion, telefono, estado")
+        .select("id_gimnasio, nombre, direccion, telefono, email, fecha_registro, estado, id_usuario")
         .eq("id_usuario", usuario["id_usuario"])
         .maybe_single()
         .execute()
     )
+    gym_data = get_data(res_gym)
+    estadisticas = None
+    if gym_data and gym_data.get("id_gimnasio"):
+        res_socios = (
+            supabase.from_("socio")
+            .select("id_socio, estado")
+            .eq("id_gimnasio", gym_data["id_gimnasio"])
+            .execute()
+        )
+        socios_gym = res_socios.data or []
+        total_socios = len(socios_gym)
+        socios_activos = sum(1 for s in socios_gym if (s.get("estado") or "").lower() == "activo")
+        estadisticas = {
+            "totalSocios": total_socios,
+            "sociosActivos": socios_activos,
+        }
+
     user_resp = dict(usuario)
-    user_resp["gimnasio"] = get_data(res_gym)
+    user_resp["gimnasio"] = gym_data
+    user_resp["estadisticas"] = estadisticas
     return {"usuario": user_resp}
+
+
+@router.put("/me", status_code=status.HTTP_200_OK)
+@router.put("/perfil", status_code=status.HTTP_200_OK)
+async def update_owner_profile(
+    req: UpdateOwnerProfileRequest,
+    current_user: Dict[str, Any] = Depends(get_current_user),
+):
+    """Permite al dueño actualizar sus datos personales (nombre, apellido, email) y cambiar su contraseña."""
+    id_usuario = current_user.get("id_usuario")
+    if not id_usuario:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Usuario no autenticado o no autorizado como administrador.",
+        )
+
+    res_curr = (
+        supabase.from_("usuario")
+        .select("*")
+        .eq("id_usuario", id_usuario)
+        .maybe_single()
+        .execute()
+    )
+    usuario_actual = get_data(res_curr)
+    if not usuario_actual:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Usuario no encontrado.")
+
+    update_fields = {}
+    if req.nombre is not None:
+        if not req.nombre.strip():
+            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="El nombre es obligatorio.")
+        update_fields["nombre"] = req.nombre.strip()
+
+    if req.apellido is not None:
+        update_fields["apellido"] = req.apellido.strip()
+
+    if req.email is not None:
+        clean_email = req.email.strip().lower()
+        if not re.match(r"^[^\s@]+@[^\s@]+\.[^\s@]+$", clean_email):
+            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="El formato del email no es válido.")
+
+        if clean_email != (usuario_actual.get("email") or "").lower():
+            res_ex = (
+                supabase.from_("usuario")
+                .select("id_usuario")
+                .ilike("email", clean_email)
+                .neq("id_usuario", id_usuario)
+                .maybe_single()
+                .execute()
+            )
+            if get_data(res_ex):
+                raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="El email ingresado ya está en uso por otra cuenta.")
+            update_fields["email"] = clean_email
+
+    if req.nueva_contrasena and req.nueva_contrasena.strip():
+        pass_limpia = req.nueva_contrasena.strip()
+        if len(pass_limpia) < 6:
+            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="La nueva contraseña debe tener al menos 6 caracteres.")
+
+        if not req.contrasena_actual:
+            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Debes ingresar tu contraseña actual para confirmar el cambio.")
+
+        if not verify_password(req.contrasena_actual, usuario_actual.get("contrasena") or ""):
+            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="La contraseña actual ingresada es incorrecta.")
+
+        update_fields["contrasena"] = get_password_hash(pass_limpia)
+
+    if not update_fields:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="No se enviaron datos para actualizar.")
+
+    res_upd = (
+        supabase.from_("usuario")
+        .update(update_fields)
+        .eq("id_usuario", id_usuario)
+        .execute()
+    )
+    if not res_upd.data:
+        raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail="Error al actualizar el usuario.")
+
+    updated_user = res_upd.data[0]
+    updated_user = {k: v for k, v in updated_user.items() if k != "contrasena"}
+
+    res_gym = (
+        supabase.from_("gimnasio")
+        .select("*")
+        .eq("id_usuario", id_usuario)
+        .maybe_single()
+        .execute()
+    )
+    gym = get_data(res_gym)
+    updated_user["gimnasio"] = gym or None
+
+    token_payload = {
+        "id_usuario": updated_user["id_usuario"],
+        "id_gimnasio": gym.get("id_gimnasio") if gym else current_user.get("id_gimnasio"),
+        "email": updated_user["email"],
+        "rol": updated_user["rol"],
+    }
+    token = create_access_token(token_payload)
+
+    return {
+        "mensaje": "Perfil actualizado exitosamente.",
+        "usuario": updated_user,
+        "token": token,
+    }

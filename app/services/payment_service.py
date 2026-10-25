@@ -51,9 +51,9 @@ async def crear_preferencia_mercadopago(
                     },
                     "external_reference": external_reference,
                     "back_urls": {
-                        "success": f"{FRONTEND_URL}/socio/membresia?pago_status=approved&ref={external_reference}",
-                        "pending": f"{FRONTEND_URL}/socio/membresia?pago_status=pending&ref={external_reference}",
-                        "failure": f"{FRONTEND_URL}/socio/membresia?pago_status=rejected&ref={external_reference}",
+                        "success": f"{FRONTEND_URL}/membresia-socio?pago_status=approved&ref={external_reference}",
+                        "pending": f"{FRONTEND_URL}/membresia-socio?pago_status=pending&ref={external_reference}",
+                        "failure": f"{FRONTEND_URL}/membresia-socio?pago_status=rejected&ref={external_reference}",
                     },
                 }
                 headers = {
@@ -86,7 +86,7 @@ async def crear_preferencia_mercadopago(
     # Modo Sandbox/Simulado
     mock_pref_id = f"MP-PREF-{int(time.time() * 1000)}-{random.randint(100, 999)}"
     mock_checkout_url = (
-        f"{FRONTEND_URL}/socio/membresia?checkout=mercadopago"
+        f"{FRONTEND_URL}/membresia-socio?checkout=mercadopago"
         f"&ref={external_reference}&pref={mock_pref_id}&monto={precio_unitario}"
     )
     encoded_url = urllib.parse.quote(mock_checkout_url)

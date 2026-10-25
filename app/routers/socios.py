@@ -1,5 +1,6 @@
+import re
 from datetime import datetime, date, timedelta
-from typing import Dict, Any, Optional
+from typing import Dict, Any, Optional, List
 import math
 from fastapi import APIRouter, HTTPException, status, Depends, Query, Path
 from app.config import supabase
@@ -14,6 +15,90 @@ from app.models.socio import (
 )
 
 router = APIRouter(prefix="/api/socios", tags=["Socios"])
+
+
+@router.get("/verificar-dni", status_code=status.HTTP_200_OK)
+async def verificar_dni_socio(
+    dni: str = Query(...),
+    current_user: Dict[str, Any] = Depends(get_current_user),
+):
+    """Verifica si un DNI ya existe en el gimnasio o si está activo en otro gimnasio."""
+    id_gimnasio = current_user.get("id_gimnasio")
+    if not dni or not str(dni).strip():
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="El DNI es requerido para la verificación.",
+        )
+
+    clean_dni = str(dni).strip()
+    dni_sin_puntos = re.sub(r"[\.\s-]", "", clean_dni)
+    dnis_a_buscar = list(set([clean_dni, dni_sin_puntos]))
+
+    # 1. Verificar si ya existe en el gimnasio actual
+    query_mismo = (
+        supabase.from_("socio")
+        .select("id_socio, nombre, apellido, dni, estado")
+        .in_("dni", dnis_a_buscar)
+    )
+    if id_gimnasio:
+        query_mismo = query_mismo.eq("id_gimnasio", id_gimnasio)
+
+    res_mismo = query_mismo.execute()
+    socios_mismo_gym = res_mismo.data or []
+    if socios_mismo_gym:
+        return {
+            "existeEnEsteGimnasio": True,
+            "vinculadoOtroGimnasio": False,
+            "socio": socios_mismo_gym[0],
+            "mensaje": "Ya existe un socio registrado con este DNI en tu gimnasio.",
+        }
+
+    # 2. Verificar si está registrado y ACTIVO en otro gimnasio
+    query_otro = (
+        supabase.from_("socio")
+        .select("""
+            id_socio,
+            nombre,
+            apellido,
+            dni,
+            estado,
+            id_gimnasio,
+            gimnasio (id_gimnasio, nombre, telefono, email)
+        """)
+        .in_("dni", dnis_a_buscar)
+        .ilike("estado", "activo")
+    )
+    if id_gimnasio:
+        query_otro = query_otro.neq("id_gimnasio", id_gimnasio)
+
+    res_otro = query_otro.execute()
+    socios_otro_gym = res_otro.data or []
+    if socios_otro_gym:
+        otro = socios_otro_gym[0]
+        nombre_gimnasio = (otro.get("gimnasio") or {}).get("nombre") or "otro gimnasio"
+        return {
+            "existeEnEsteGimnasio": False,
+            "vinculadoOtroGimnasio": True,
+            "gimnasio": {
+                "id_gimnasio": otro.get("id_gimnasio"),
+                "nombre": nombre_gimnasio,
+                "telefono": (otro.get("gimnasio") or {}).get("telefono"),
+            },
+            "socio": {
+                "id_socio": otro.get("id_socio"),
+                "nombre": otro.get("nombre"),
+                "apellido": otro.get("apellido"),
+                "dni": otro.get("dni"),
+                "estado": otro.get("estado"),
+            },
+            "bloqueado": True,
+            "mensaje": f'No se puede registrar este socio: actualmente figura ACTIVO en el gimnasio "{nombre_gimnasio}". Debe tramitar la baja en dicho establecimiento antes de poder inscribirse.',
+        }
+
+    return {
+        "existeEnEsteGimnasio": False,
+        "vinculadoOtroGimnasio": False,
+    }
 
 
 @router.get("/perfil", status_code=status.HTTP_200_OK)
@@ -34,7 +119,7 @@ async def get_perfil_socio(
     if not target_id:
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
-            detail="No se especificó el ID del socio."
+            detail="No se especificó el ID del socio a consultar (?id=)."
         )
 
     res = (

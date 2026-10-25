@@ -22,6 +22,8 @@ from app.routers import (
     rutinas,
     asistencias,
     dashboard_socio,
+    dashboard_admin,
+    socio_ejercicios,
 )
 
 # 1. INICIALIZACIÓN DE LA APLICACIÓN FASTAPI
@@ -114,6 +116,8 @@ app.include_router(ejercicios.router)
 app.include_router(rutinas.router)
 app.include_router(asistencias.router)
 app.include_router(dashboard_socio.router)
+app.include_router(dashboard_admin.router)
+app.include_router(socio_ejercicios.router)
 
 
 # 5. PUESTA EN MARCHA DEL SERVIDOR

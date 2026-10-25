@@ -1,10 +1,10 @@
-from typing import Optional
+from typing import Optional, Any, Dict, Union
 from pydantic import BaseModel, Field
 
 
 class RutinaCreate(BaseModel):
     nombre: str = Field(..., min_length=1)
-    descripcion: Optional[str] = None
+    descripcion: Optional[Any] = None
     id_socio: Optional[int] = None
     fecha_inicio: Optional[str] = None
     fecha_fin: Optional[str] = None
@@ -13,11 +13,19 @@ class RutinaCreate(BaseModel):
 
 class RutinaUpdate(BaseModel):
     nombre: Optional[str] = None
-    descripcion: Optional[str] = None
+    descripcion: Optional[Any] = None
     id_socio: Optional[int] = None
     fecha_inicio: Optional[str] = None
     fecha_fin: Optional[str] = None
     estado: Optional[str] = None
+
+
+class RutinaAdoptar(BaseModel):
+    plantilla: Optional[Dict[str, Any]] = None
+    id_plantilla: Optional[str] = None
+    id_socio: Optional[int] = None
+    nombre_personalizado: Optional[str] = None
+
 
 
 class RutinaEjercicioAdd(BaseModel):

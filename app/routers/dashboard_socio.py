@@ -133,7 +133,7 @@ async def get_dashboard_socio(
     if not socio:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="No se encontraron datos del socio en el sistema.")
 
-    # 2. Membresía más reciente
+    # 2. Membresías del socio (para resolver membresía activa vigente)
     res_memb = (
         supabase.from_("membresia")
         .select("""
@@ -146,17 +146,29 @@ async def get_dashboard_socio(
             plan_membresia (
                 id_plan_membresia,
                 nombre,
+                descripcion,
                 precio,
-                duracion_dias
+                duracion_dias,
+                estado
             )
         """)
         .eq("id_socio", id_socio)
         .order("fecha_vencimiento", desc=True)
-        .limit(1)
-        .maybe_single()
         .execute()
     )
-    membresia = get_data(res_memb)
+    raw_membresias = res_memb.data or []
+    ESTADOS_EXCLUIDOS = [
+        "inactivo", "inactiva", "pausa", "pausado", "pausada",
+        "cancelado", "cancelada", "eliminado", "eliminada", "sin_membresia"
+    ]
+    membresia = next(
+        (
+            m for m in raw_membresias
+            if (m.get("estado") or "").lower().strip() not in ESTADOS_EXCLUIDOS
+            and (((m.get("plan_membresia") or {}).get("estado") or "").lower().strip() not in ESTADOS_EXCLUIDOS if m.get("plan_membresia") else True)
+        ),
+        None
+    )
 
     # 3. Último pago
     res_pago = (
@@ -309,8 +321,13 @@ async def get_dashboard_socio(
             "porcentaje_transcurrido": porcentaje_transcurrido,
             "expirada": membresia_expirada,
         } if membresia else {
+            "id_membresia": None,
             "estado": "sin_membresia",
-            "mensaje": "No tienes una membresía activa asignada.",
+            "plan": "Sin Membresía Activa",
+            "mensaje": "No tienes una membresía activa asignada actualmente.",
+            "dias_restantes": 0,
+            "porcentaje_transcurrido": 0,
+            "expirada": True,
         },
         "ultimo_pago": ultimo_pago,
         "progreso": {
@@ -548,11 +565,15 @@ async def get_planes_disponibles(current_user: Dict[str, Any] = Depends(get_curr
         except Exception:
             planes = planes_semilla
 
-    # 3. Estructurar y clasificar planes para el frontend
+    # 3. Estructurar y clasificar planes para el frontend (excluyendo pausados, inactivos, cancelados)
+    ESTADOS_MEMBRESIA_INACTIVOS = [
+        "inactivo", "inactiva", "pausa", "pausado", "pausada",
+        "cancelado", "cancelada", "eliminado", "eliminada"
+    ]
     planes_formateados = []
     for plan in (planes or []):
-        est = (plan.get("estado") or "").lower()
-        if est and est != "activo":
+        est = (plan.get("estado") or "").lower().strip()
+        if est in ESTADOS_MEMBRESIA_INACTIVOS or (est and est not in ("activo", "activa")):
             continue
 
         precio_num = float(plan.get("precio", 0) or 0)
@@ -609,6 +630,10 @@ async def solicitar_actualizacion(
     plan = get_data(res_plan)
     if not plan:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="El plan seleccionado no existe.")
+
+    estado_plan = (plan.get("estado") or "").lower().strip()
+    if estado_plan in ("inactivo", "inactiva", "pausa", "pausado", "pausada", "cancelado", "cancelada", "eliminado", "eliminada"):
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Este plan de membresía se encuentra en pausa o inactivo en este momento.")
 
     meses = req.meses or 1
     duracion_dias = (plan.get("duracion_dias") or 30) * meses
@@ -702,6 +727,13 @@ async def iniciar_pago(
     plan = get_data(res_plan)
     if not plan:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Plan de membresía no encontrado.")
+
+    estado_plan = (plan.get("estado") or "").lower().strip()
+    if estado_plan in ("inactivo", "inactiva", "pausa", "pausado", "pausada", "cancelado", "cancelada", "eliminado", "eliminada"):
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="El plan de membresía seleccionado se encuentra pausado o inactivo y no admite nuevos pagos.")
+
+    if socio.get("id_gimnasio") and plan.get("id_gimnasio") and plan["id_gimnasio"] != socio["id_gimnasio"]:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="El plan de membresía no pertenece a tu gimnasio.")
 
     # Gimnasio
     res_gym = (

@@ -153,3 +153,53 @@ async def deshabilitar_plan_membresia(
         "mensaje": "Plan de membresía marcado como 'inactivo' exitosamente.",
         "plan": res.data[0],
     }
+
+
+@router.delete("/{id}", status_code=status.HTTP_200_OK)
+async def delete_plan_membresia(
+    id: int = Path(...),
+    current_user: Dict[str, Any] = Depends(get_current_user),
+):
+    """Eliminar un plan de membresía o marcar como inactivo si tiene membresías asociadas."""
+    id_gimnasio = current_user.get("id_gimnasio")
+    if not id_gimnasio:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="No se identificó el gimnasio autenticado.",
+        )
+
+    # Verificar si el plan pertenece al gimnasio
+    res_plan = (
+        supabase.from_("plan_membresia")
+        .select("id_plan_membresia")
+        .eq("id_plan_membresia", id)
+        .eq("id_gimnasio", id_gimnasio)
+        .maybe_single()
+        .execute()
+    )
+    if not get_data(res_plan):
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Plan de membresía no encontrado o no pertenece a tu gimnasio.",
+        )
+
+    try:
+        res_del = (
+            supabase.from_("plan_membresia")
+            .delete()
+            .eq("id_plan_membresia", id)
+            .eq("id_gimnasio", id_gimnasio)
+            .execute()
+        )
+    except Exception as exc:
+        msg = str(exc).lower()
+        if "foreign key" in msg or "violates" in msg or "23503" in msg:
+            supabase.from_("plan_membresia").update({"estado": "inactivo"}).eq("id_plan_membresia", id).eq("id_gimnasio", id_gimnasio).execute()
+            return {
+                "mensaje": "El plan tiene membresías asociadas a socios. Se ha marcado como inactivo para preservar el historial.",
+                "inactivo": True,
+            }
+        raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail=f"Error al eliminar el plan: {exc}")
+
+    return {"mensaje": "Plan de membresía eliminado exitosamente."}
+
