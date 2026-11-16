@@ -425,7 +425,7 @@ async def get_mi_membresia(current_user: Dict[str, Any] = Depends(get_current_us
     if not socio:
         raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Acceso no autorizado. Perfil no identificado.")
 
-    # 1. Membresía más reciente
+    # 1. Membresía más reciente vigente (excluyendo pausadas/inactivas/canceladas)
     res_m = (
         supabase.from_("membresia")
         .select("""
@@ -434,11 +434,21 @@ async def get_mi_membresia(current_user: Dict[str, Any] = Depends(get_current_us
         """)
         .eq("id_socio", socio["id_socio"])
         .order("fecha_vencimiento", desc=True)
-        .limit(1)
-        .maybe_single()
         .execute()
     )
-    membresia = get_data(res_m)
+    raw_membresias = res_m.data or []
+    ESTADOS_EXCLUIDOS = [
+        "inactivo", "inactiva", "pausa", "pausado", "pausada",
+        "cancelado", "cancelada", "eliminado", "eliminada", "sin_membresia"
+    ]
+    membresia = next(
+        (
+            m for m in raw_membresias
+            if (m.get("estado") or "").lower().strip() not in ESTADOS_EXCLUIDOS
+            and (((m.get("plan_membresia") or {}).get("estado") or "").lower().strip() not in ESTADOS_EXCLUIDOS if m.get("plan_membresia") else True)
+        ),
+        None
+    )
 
     # 2. Historial de pagos
     res_pagos = (
@@ -492,6 +502,7 @@ async def get_mi_membresia(current_user: Dict[str, Any] = Depends(get_current_us
         plan_obj = membresia.get("plan_membresia") or {}
         precio_monto = float(membresia.get("precio") or plan_obj.get("precio", 0))
         membresia_resp = {
+            "tiene_membresia": metricas["tiene_membresia"],
             "id_membresia": membresia["id_membresia"],
             "id_plan_membresia": membresia.get("id_plan_membresia"),
             "nombre_plan": plan_obj.get("nombre", "Plan Estándar"),
@@ -514,6 +525,7 @@ async def get_mi_membresia(current_user: Dict[str, Any] = Depends(get_current_us
         "membresia": membresia_resp,
         "metricas": metricas,
         "pagos": pagos,
+        "historial_pagos": pagos,
         "planes_disponibles": planes,
     }
 

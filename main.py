@@ -2,6 +2,7 @@
 # SERVIDOR PRINCIPAL DE GYMTRACK (FASTAPI + PYTHON)
 # ==============================================================================
 
+
 from datetime import datetime, timezone
 import uvicorn
 from fastapi import FastAPI, status, Response, Request
