@@ -1,7 +1,88 @@
 from datetime import datetime, date
-from typing import Optional, Dict, Any
+from typing import Optional, Dict, Any, Tuple
+from fastapi import HTTPException, status
 
 MESES_ES = ['Ene', 'Feb', 'Mar', 'Abr', 'May', 'Jun', 'Jul', 'Ago', 'Sep', 'Oct', 'Nov', 'Dic']
+
+
+def map_postgrest_error(exc: Exception) -> Tuple[int, str]:
+    """
+    Mapeo centralizado de excepciones `postgrest.exceptions.APIError` y errores de PostgreSQL/RPC
+    hacia códigos HTTP semánticos (409, 403, 404, 400, 502):
+      - 23505 (unique_violation) -> 409 Conflict
+      - 42501 (insufficient_privilege / RLS) -> 403 Forbidden
+      - 23503 (foreign_key_violation) -> 409 si RESTRICT/en uso, si no 400 Bad Request
+      - 23514 (check_violation) / 23502 (not_null) / 22P02 (invalid_text_representation) -> 400 Bad Request
+      - PGRST200 / PGRST202 / PGRST204 (error de esquema/relación PostgREST) -> 502 Bad Gateway
+      - P0001 (raise exception de triggers/RPCs) -> inferido según mensaje (409/403/404/400)
+    """
+    code = str(getattr(exc, "code", None) or "").strip().upper()
+    message = str(getattr(exc, "message", None) or str(exc) or "").strip()
+    details = str(getattr(exc, "details", None) or "").strip()
+    combined = f"{message} {details}".strip().lower()
+
+    if code == "23505":
+        return status.HTTP_409_CONFLICT, message or "Conflicto de unicidad: el registro ya existe."
+    if code == "42501":
+        return status.HTTP_403_FORBIDDEN, message or "Permiso denegado por las políticas de seguridad de la base de datos."
+    if code == "23503":
+        if any(k in combined for k in ("still referenced", "restrict", "delete")):
+            return status.HTTP_409_CONFLICT, message or "No se puede completar la operación porque el registro está referenciado por historial."
+        return status.HTTP_400_BAD_REQUEST, message or "Referencia inválida: la entidad relacionada no existe o pertenece a otro gimnasio."
+    if code in ("23514", "23502", "22P02", "22001", "22003", "22007"):
+        return status.HTTP_400_BAD_REQUEST, message or "Los datos enviados violan una restricción de validación del esquema."
+    if code in ("PGRST200", "PGRST201", "PGRST202", "PGRST204"):
+        return status.HTTP_502_BAD_GATEWAY, f"Error de compatibilidad de consulta PostgREST ({code}): {message}"
+    if code == "PGRST116":
+        return status.HTTP_404_NOT_FOUND, message or "Recurso no encontrado."
+
+    # Excepciones de negocio (`P0001` u otros raise exception de triggers/RPCs)
+    if any(
+        k in combined
+        for k in (
+            "ya existe",
+            "ya se encuentra",
+            "duplicad",
+            "conflicto",
+            "superpuest",
+            "límite máximo",
+            "limite maximo",
+            "ya fue anulada",
+            "ya finalizada",
+            "transición inválida",
+            "transicion invalida",
+            "inmutable",
+            "ingreso en curso",
+        )
+    ):
+        return status.HTTP_409_CONFLICT, message or "Conflicto de estado o duplicidad."
+    if any(
+        k in combined
+        for k in (
+            "no tienes autorización",
+            "no tienes permisos",
+            "sin permisos",
+            "no autorizado",
+            "no autorizados",
+            "no está permitido transferir",
+            "no esta permitido transferir",
+            "no se puede reasignar la rutina",
+            "row-level security",
+            "permission denied",
+        )
+    ):
+        return status.HTTP_403_FORBIDDEN, message or "No tienes autorización para realizar esta operación."
+    if any(k in combined for k in ("no existe", "no encontrad", "no se encontró", "not found")):
+        return status.HTTP_404_NOT_FOUND, message or "Recurso no encontrado."
+
+    return status.HTTP_400_BAD_REQUEST, message or "No se pudo completar la operación en la base de datos."
+
+
+def raise_http_from_postgrest_error(exc: Exception, prefix: Optional[str] = None) -> None:
+    """Convierte una excepción de PostgREST/RPC en un HTTPException con código semántico."""
+    http_status, msg = map_postgrest_error(exc)
+    detail = f"{prefix}: {msg}" if prefix else msg
+    raise HTTPException(status_code=http_status, detail=detail) from exc
 
 
 def get_data(res: Any) -> Any:
@@ -10,6 +91,45 @@ def get_data(res: Any) -> Any:
         return None
     if hasattr(res, "data"):
         return res.data
+    return None
+
+
+def insert_gimnasio_with_rls(
+    db: Any,
+    payload: Dict[str, Any],
+    columns: str = "id_gimnasio, nombre, telefono, email, fecha_registro, estado, id_dueno",
+) -> Optional[Dict[str, Any]]:
+    """
+    Inserta un registro en `public.gimnasio` respetando estrictamente RLS del dueño.
+
+    Usa `returning="minimal"` en PostgREST para evitar `INSERT ... RETURNING *` dentro de la
+    misma sentencia SQL: la política `gimnasio_select_authorized` evalúa `fn_dueno_posee_gimnasio`
+    (función `STABLE` que consulta `public.gimnasio` con el snapshot previo al INSERT).
+    Tras completar el INSERT, recupera la fila recién creada en un segundo `SELECT`, donde
+    el registro ya está confirmado y es visible para `fn_dueno_posee_gimnasio`.
+    """
+    table_builder = db.from_("gimnasio")
+    try:
+        res_ins = table_builder.insert([payload], returning="minimal").execute()
+    except TypeError:
+        res_ins = table_builder.insert([payload]).execute()
+
+    rows = get_data(res_ins)
+    if isinstance(rows, list) and rows:
+        return rows[0]
+
+    sel_query = (
+        db.from_("gimnasio")
+        .select(columns)
+        .eq("id_dueno", payload["id_dueno"])
+        .eq("nombre", payload["nombre"])
+        .order("id_gimnasio", desc=True)
+        .limit(1)
+    )
+    res_sel = sel_query.execute()
+    sel_rows = get_data(res_sel)
+    if isinstance(sel_rows, list) and sel_rows:
+        return sel_rows[0]
     return None
 
 
@@ -46,7 +166,7 @@ def formatear_precio_ars(monto: Any) -> str:
 
 
 def calcular_metricas_membresia(membresia: Optional[Dict[str, Any]]) -> Dict[str, Any]:
-    """Calcula métricas detalladas de vigencia, días restantes y progreso de membresía."""
+    """Calcula métricas detalladas de vigencia, días restantes y porcentaje transcurrido de membresía."""
     if not membresia or not membresia.get("fecha_vencimiento"):
         return {
             "tiene_membresia": False,
@@ -85,10 +205,13 @@ def calcular_metricas_membresia(membresia: Optional[Dict[str, Any]]) -> Dict[str
     else:
         tiempo_restante_texto = f"{dias_restantes} días"
 
-    estado_clave = (membresia.get("estado") or "activo").lower()
+    estado_clave = (membresia.get("estado") or "activa").lower()
     estado_etiqueta = "Activa"
 
-    if esta_vencida or estado_clave in ("vencido", "vencida"):
+    if estado_clave == "cancelada":
+        estado_clave = "cancelada"
+        estado_etiqueta = "Cancelada"
+    elif esta_vencida or estado_clave in ("vencido", "vencida"):
         estado_clave = "vencida"
         estado_etiqueta = "Vencida"
     elif estado_clave == "pendiente":

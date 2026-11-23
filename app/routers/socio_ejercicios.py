@@ -1,301 +1,289 @@
 from typing import Dict, Any, Optional, List
 from fastapi import APIRouter, HTTPException, status, Depends, Query, Path
-from pydantic import BaseModel
+from supabase import Client
 
-from app.config import supabase
 from app.core.dependencies import get_current_user
 from app.services.utils import get_data
+from app.models.ejercicio import EjercicioSocioCreate, EjercicioSocioUpdate
+from app.routers.socios import (
+    _resolve_socio_profile_context,
+    _fetch_socio_gimnasios_for_socio,
+)
+from app.routers.ejercicios import (
+    EJERCICIO_SOCIO_COLUMNS,
+    EJERCICIO_GIMNASIO_COLUMNS,
+    _filter_ejercicios,
+)
 
-router = APIRouter(prefix="/api/socio/ejercicios", tags=["Socio - Ejercicios"])
-
-
-class SocioEjercicioCreate(BaseModel):
-    nombre: str
-    grupo_muscular: Optional[str] = "General"
-    descripcion: Optional[str] = None
-    dificultad: Optional[str] = "Intermedia"
-
-
-class SocioEjercicioUpdate(BaseModel):
-    nombre: Optional[str] = None
-    grupo_muscular: Optional[str] = None
-    descripcion: Optional[str] = None
-    dificultad: Optional[str] = None
+router = APIRouter(prefix="/api/socio/ejercicios", tags=["Socio - Ejercicios Personales"])
 
 
-async def resolver_socio_autenticado(current_user: Dict[str, Any]) -> Dict[str, Optional[int]]:
-    """Resuelve el id_socio e id_gimnasio del usuario autenticado."""
-    id_socio = current_user.get("id_socio")
-    id_gimnasio = current_user.get("id_gimnasio")
-
-    if not id_socio and current_user.get("id_usuario"):
-        res = (
-            supabase.from_("socio")
-            .select("id_socio, id_gimnasio")
-            .eq("id_usuario", current_user["id_usuario"])
-            .maybe_single()
-            .execute()
-        )
-        s_auth = get_data(res)
-        if s_auth:
-            id_socio = s_auth.get("id_socio")
-            id_gimnasio = s_auth.get("id_gimnasio")
-
-    if id_socio and not id_gimnasio:
-        res = (
-            supabase.from_("socio")
-            .select("id_gimnasio")
-            .eq("id_socio", id_socio)
-            .maybe_single()
-            .execute()
-        )
-        s_data = get_data(res)
-        if s_data:
-            id_gimnasio = s_data.get("id_gimnasio")
-
+def _format_ejercicio_socio(ej: Dict[str, Any]) -> Dict[str, Any]:
     return {
-        "id_socio": int(id_socio) if id_socio else None,
-        "id_gimnasio": int(id_gimnasio) if id_gimnasio else None,
-    }
-
-
-def enriquecer_ejercicio_socio(ej: Dict[str, Any], id_socio: int) -> Dict[str, Any]:
-    es_propio = bool(ej.get("id_socio") and int(ej["id_socio"]) == int(id_socio))
-    return {
-        "id_ejercicio": ej.get("id_ejercicio"),
+        "id_ejercicio_socio": ej.get("id_ejercicio_socio"),
+        "id_socio": ej.get("id_socio"),
         "nombre": ej.get("nombre"),
-        "descripcion": ej.get("descripcion") or "Sin descripción técnica disponible",
+        "descripcion": ej.get("descripcion"),
         "grupo_muscular": ej.get("grupo_muscular") or "General",
         "dificultad": ej.get("dificultad") or "Intermedia",
-        "id_gimnasio": ej.get("id_gimnasio"),
-        "id_socio": ej.get("id_socio"),
-        "origen": "Mi ejercicio" if es_propio else "Gimnasio",
-        "tipo_origen": "propio" if es_propio else "gimnasio",
-        "es_propio": es_propio,
-        "es_gimnasio": not bool(ej.get("id_socio")),
-        "puede_editar": es_propio,
-        "puede_eliminar": es_propio,
+        "estado": ej.get("estado", True),
+        "creado_en": ej.get("creado_en"),
+        "origen": "Mi ejercicio",
+        "tipo_origen": "propio",
+        "es_propio": True,
+        "es_gimnasio": False,
+        "puede_editar": True,
+        "puede_eliminar": True,
     }
+
+
+def _format_ejercicio_gym_para_socio(ej: Dict[str, Any]) -> Dict[str, Any]:
+    return {
+        "id_ejercicio_gimnasio": ej.get("id_ejercicio_gimnasio"),
+        "id_gimnasio": ej.get("id_gimnasio"),
+        "nombre": ej.get("nombre"),
+        "descripcion": ej.get("descripcion"),
+        "grupo_muscular": ej.get("grupo_muscular") or "General",
+        "dificultad": ej.get("dificultad") or "Intermedia",
+        "estado": ej.get("estado", True),
+        "creado_en": ej.get("creado_en"),
+        "origen": "Gimnasio",
+        "tipo_origen": "gimnasio",
+        "es_propio": False,
+        "es_gimnasio": True,
+        "puede_editar": False,
+        "puede_eliminar": False,
+    }
+
+
+def _fetch_ejercicio_socio_or_404(db: Client, id_ejercicio_socio: int) -> Dict[str, Any]:
+    res = (
+        db.from_("ejercicio_socio")
+        .select(EJERCICIO_SOCIO_COLUMNS)
+        .eq("id_ejercicio_socio", id_ejercicio_socio)
+        .maybe_single()
+        .execute()
+    )
+    ej = get_data(res)
+    if not isinstance(ej, dict):
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Ejercicio personal no encontrado.",
+        )
+    return ej
 
 
 @router.get("", status_code=status.HTTP_200_OK)
 async def get_ejercicios_socio(
-    origen: str = Query("todos"),
-    grupo_muscular: Optional[str] = Query(None),
-    search: Optional[str] = Query(None),
+    origen: str = Query(default="propio"),
+    id_gimnasio: Optional[int] = Query(default=None, gt=0),
+    grupo_muscular: Optional[str] = Query(default=None),
+    search: Optional[str] = Query(default=None),
     current_user: Dict[str, Any] = Depends(get_current_user),
 ):
     """
-    Consultar ejercicios disponibles del gimnasio y propios creados por el socio.
-    Filtros opcionales: origen ('todos' | 'gimnasio' | 'propio'), grupo_muscular, search.
+    Consulta los ejercicios personales (`public.ejercicio_socio`) del socio autenticado y,
+    opcionalmente (`origen='todos'` o `'gimnasio'`), los ejercicios activos de sus gimnasios
+    asociados (`public.ejercicio_gimnasio`), manteniéndolos claramente diferenciados.
     """
-    ident = await resolver_socio_autenticado(current_user)
-    id_socio = ident["id_socio"]
-    id_gimnasio = ident["id_gimnasio"]
+    socio_ctx = _resolve_socio_profile_context(current_user)
+    own_socio_id = int(socio_ctx["id_socio"])
+    db: Client = socio_ctx["supabase"]
 
-    if not id_socio:
-        raise HTTPException(
-            status_code=status.HTTP_401_UNAUTHORIZED,
-            detail="Acceso no autorizado: Perfil de socio no encontrado.",
+    origen_norm = origen.strip().lower()
+    resultado: List[Dict[str, Any]] = []
+
+    if origen_norm in ("propio", "todos"):
+        res_p = (
+            db.from_("ejercicio_socio")
+            .select(EJERCICIO_SOCIO_COLUMNS)
+            .eq("id_socio", own_socio_id)
+            .order("nombre", desc=False)
+            .execute()
         )
+        raw_p = get_data(res_p) or []
+        for ej in _filter_ejercicios(
+            raw_p if isinstance(raw_p, list) else [],
+            grupo_muscular=grupo_muscular,
+            search=search,
+        ):
+            if int(ej.get("id_socio") or 0) == own_socio_id:
+                resultado.append(_format_ejercicio_socio(ej))
 
-    query = supabase.from_("ejercicio").select("*")
+    if origen_norm in ("gimnasio", "todos"):
+        asocs = _fetch_socio_gimnasios_for_socio(db, own_socio_id)
+        active_gyms = {
+            int(a["id_gimnasio"])
+            for a in asocs
+            if a.get("estado") is True and a.get("id_gimnasio") is not None
+        }
+        if id_gimnasio is not None and id_gimnasio not in active_gyms:
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail="No posees asociación activa con el gimnasio solicitado.",
+            )
+        target_gyms = [id_gimnasio] if id_gimnasio is not None else sorted(active_gyms)
+        if target_gyms:
+            q_g = db.from_("ejercicio_gimnasio").select(EJERCICIO_GIMNASIO_COLUMNS)
+            if len(target_gyms) == 1:
+                q_g = q_g.eq("id_gimnasio", target_gyms[0])
+            else:
+                q_g = q_g.in_("id_gimnasio", target_gyms)
+            res_g = q_g.order("nombre", desc=False).execute()
+            raw_g = get_data(res_g) or []
+            for ej in _filter_ejercicios(
+                raw_g if isinstance(raw_g, list) else [],
+                grupo_muscular=grupo_muscular,
+                search=search,
+                only_active=True,
+            ):
+                if int(ej.get("id_gimnasio") or 0) in set(target_gyms):
+                    resultado.append(_format_ejercicio_gym_para_socio(ej))
 
-    # Filtrar según el origen solicitado:
-    if origen == "gimnasio":
-        if id_gimnasio:
-            query = query.eq("id_gimnasio", id_gimnasio).is_("id_socio", "null")
-        else:
-            query = query.is_("id_socio", "null")
-    elif origen == "propio":
-        query = query.eq("id_socio", id_socio)
-    else:
-        # 'todos': ejercicios oficiales del gimnasio + propios del socio
-        if id_gimnasio:
-            query = query.or_(f"and(id_gimnasio.eq.{id_gimnasio},id_socio.is.null),id_socio.eq.{id_socio}")
-        else:
-            query = query.or_(f"id_socio.is.null,id_socio.eq.{id_socio}")
-
-    if grupo_muscular and grupo_muscular.lower() != "todos":
-        query = query.ilike("grupo_muscular", f"%{grupo_muscular.strip()}%")
-
-    if search and search.strip():
-        query = query.ilike("nombre", f"%{search.strip()}%")
-
-    res = query.order("nombre", desc=False).execute()
-    ejercicios_raw = res.data or []
-
-    ejercicios_diferenciados = [
-        enriquecer_ejercicio_socio(ej, id_socio) for ej in ejercicios_raw
-    ]
-
-    return ejercicios_diferenciados
+    return resultado
 
 
 @router.post("", status_code=status.HTTP_201_CREATED)
 async def crear_ejercicio_socio(
-    req: SocioEjercicioCreate,
+    req: EjercicioSocioCreate,
     current_user: Dict[str, Any] = Depends(get_current_user),
 ):
-    """Crear un nuevo ejercicio personalizado propio del socio."""
-    ident = await resolver_socio_autenticado(current_user)
-    id_socio = ident["id_socio"]
-    id_gimnasio = ident["id_gimnasio"]
+    """Crea un ejercicio personal en `public.ejercicio_socio` propiedad exclusiva del socio autenticado."""
+    socio_ctx = _resolve_socio_profile_context(current_user)
+    own_socio_id = int(socio_ctx["id_socio"])
 
-    if not id_socio:
-        raise HTTPException(
-            status_code=status.HTTP_401_UNAUTHORIZED,
-            detail="Acceso no autorizado: Perfil de socio no encontrado.",
-        )
-
-    if not req.nombre or not req.nombre.strip():
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail="El nombre del ejercicio es obligatorio.",
-        )
-
-    nuevo = {
-        "nombre": req.nombre.strip(),
-        "grupo_muscular": req.grupo_muscular.strip() if req.grupo_muscular else "General",
-        "descripcion": req.descripcion.strip() if req.descripcion else None,
-        "dificultad": req.dificultad or "Intermedia",
-        "id_socio": id_socio,
-        "id_gimnasio": id_gimnasio,
-    }
-
-    res = supabase.from_("ejercicio").insert([nuevo]).execute()
-    if not res.data:
-        raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail="Error al crear el ejercicio propio.",
-        )
-
-    creado = res.data[0]
-    return {
-        "mensaje": "¡Ejercicio propio creado exitosamente!",
-        "ejercicio": enriquecer_ejercicio_socio(creado, id_socio),
-    }
-
-
-@router.put("/{id}", status_code=status.HTTP_200_OK)
-async def actualizar_ejercicio_socio(
-    id: int = Path(...),
-    req: SocioEjercicioUpdate = ...,
-    current_user: Dict[str, Any] = Depends(get_current_user),
-):
-    """
-    Modificar un ejercicio propio.
-    Valida que el socio SOLO pueda modificar ejercicios creados por él.
-    """
-    ident = await resolver_socio_autenticado(current_user)
-    id_socio = ident["id_socio"]
-
-    if not id_socio:
-        raise HTTPException(
-            status_code=status.HTTP_401_UNAUTHORIZED,
-            detail="Acceso no autorizado.",
-        )
-
-    # 1. Consultar el ejercicio a editar
-    res_ex = (
-        supabase.from_("ejercicio")
-        .select("id_ejercicio, id_socio, id_gimnasio, nombre")
-        .eq("id_ejercicio", id)
-        .maybe_single()
-        .execute()
-    )
-    ej_existente = get_data(res_ex)
-    if not ej_existente:
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
-            detail="El ejercicio solicitado no fue encontrado.",
-        )
-
-    # 2. VALIDACIÓN ESTRICTA: El socio solamente puede modificar sus propios ejercicios
-    if not ej_existente.get("id_socio") or int(ej_existente["id_socio"]) != int(id_socio):
+    if req.id_socio is not None and str(req.id_socio).strip() != str(own_socio_id):
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,
-            detail="Permiso denegado: No tienes autorización para modificar ejercicios del gimnasio o pertenecientes a otros socios.",
+            detail="No puedes crear ejercicios personales para otro socio.",
         )
 
-    update_fields = {}
-    if req.nombre is not None and req.nombre.strip():
-        update_fields["nombre"] = req.nombre.strip()
+    clean_nombre = req.nombre.strip()
+    if not clean_nombre:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="El nombre del ejercicio es obligatorio.")
+
+    db: Client = socio_ctx["supabase"]
+    nuevo = {
+        "id_socio": own_socio_id,
+        "nombre": clean_nombre,
+        "grupo_muscular": req.grupo_muscular.strip() if req.grupo_muscular and req.grupo_muscular.strip() else "General",
+        "descripcion": req.descripcion.strip() if req.descripcion and req.descripcion.strip() else None,
+        "dificultad": req.dificultad.strip() if req.dificultad and req.dificultad.strip() else "Intermedia",
+        "estado": bool(req.estado),
+    }
+
+    res = db.from_("ejercicio_socio").insert([nuevo]).execute()
+    rows = get_data(res) or []
+    if not rows:
+        raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail="Error al crear el ejercicio personal.")
+
+    return {
+        "mensaje": "Ejercicio personal creado exitosamente.",
+        "ejercicio": _format_ejercicio_socio(rows[0]),
+    }
+
+
+@router.put("/{id_ejercicio_socio}", status_code=status.HTTP_200_OK)
+async def actualizar_ejercicio_socio(
+    req: EjercicioSocioUpdate,
+    id_ejercicio_socio: int = Path(..., gt=0),
+    current_user: Dict[str, Any] = Depends(get_current_user),
+):
+    """Actualiza un ejercicio personal de `public.ejercicio_socio` validando propiedad exclusiva del socio."""
+    socio_ctx = _resolve_socio_profile_context(current_user)
+    own_socio_id = int(socio_ctx["id_socio"])
+
+    if req.id_socio is not None and str(req.id_socio).strip() != str(own_socio_id):
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="No está permitido transferir un ejercicio personal a otro socio.",
+        )
+
+    db: Client = socio_ctx["supabase"]
+    ej_existente = _fetch_ejercicio_socio_or_404(db, id_ejercicio_socio)
+    if int(ej_existente.get("id_socio") or 0) != own_socio_id:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="No tienes autorización para modificar ejercicios personales de otro socio.",
+        )
+
+    update_fields: Dict[str, Any] = {}
+    if req.nombre is not None:
+        clean_nombre = req.nombre.strip()
+        if not clean_nombre:
+            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="El nombre no puede estar vacío.")
+        update_fields["nombre"] = clean_nombre
     if req.grupo_muscular is not None:
-        update_fields["grupo_muscular"] = req.grupo_muscular.strip()
+        update_fields["grupo_muscular"] = req.grupo_muscular.strip() or None
     if req.descripcion is not None:
-        update_fields["descripcion"] = req.descripcion.strip() if req.descripcion else None
+        update_fields["descripcion"] = req.descripcion.strip() or None
     if req.dificultad is not None:
-        update_fields["dificultad"] = req.dificultad
+        update_fields["dificultad"] = req.dificultad.strip() or None
+    if req.estado is not None:
+        update_fields["estado"] = bool(req.estado)
+
+    if not update_fields:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="No se enviaron campos para actualizar.")
 
     res_upd = (
-        supabase.from_("ejercicio")
+        db.from_("ejercicio_socio")
         .update(update_fields)
-        .eq("id_ejercicio", id)
+        .eq("id_ejercicio_socio", id_ejercicio_socio)
+        .eq("id_socio", own_socio_id)
         .execute()
     )
-    if not res_upd.data:
-        raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail="Error al actualizar el ejercicio.",
-        )
+    rows = get_data(res_upd) or []
+    if not rows:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Ejercicio personal no encontrado.")
 
     return {
-        "mensaje": "Ejercicio propio actualizado con éxito.",
-        "ejercicio": enriquecer_ejercicio_socio(res_upd.data[0], id_socio),
+        "mensaje": "Ejercicio personal actualizado con éxito.",
+        "ejercicio": _format_ejercicio_socio(rows[0]),
     }
 
 
-@router.delete("/{id}", status_code=status.HTTP_200_OK)
+@router.delete("/{id_ejercicio_socio}", status_code=status.HTTP_200_OK)
 async def eliminar_ejercicio_socio(
-    id: int = Path(...),
+    id_ejercicio_socio: int = Path(..., gt=0),
     current_user: Dict[str, Any] = Depends(get_current_user),
 ):
-    """
-    Eliminar un ejercicio propio.
-    Valida que el socio SOLO pueda eliminar ejercicios creados por él.
-    """
-    ident = await resolver_socio_autenticado(current_user)
-    id_socio = ident["id_socio"]
+    """Elimina un ejercicio personal de `public.ejercicio_socio` verificando que no esté referenciado en `rutina_ejercicio_socio`."""
+    socio_ctx = _resolve_socio_profile_context(current_user)
+    own_socio_id = int(socio_ctx["id_socio"])
+    db: Client = socio_ctx["supabase"]
 
-    if not id_socio:
-        raise HTTPException(
-            status_code=status.HTTP_401_UNAUTHORIZED,
-            detail="Acceso no autorizado.",
-        )
-
-    # 1. Consultar el ejercicio a eliminar
-    res_ex = (
-        supabase.from_("ejercicio")
-        .select("id_ejercicio, id_socio, id_gimnasio, nombre")
-        .eq("id_ejercicio", id)
-        .maybe_single()
-        .execute()
-    )
-    ej_existente = get_data(res_ex)
-    if not ej_existente:
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
-            detail="El ejercicio solicitado no fue encontrado.",
-        )
-
-    # 2. VALIDACIÓN ESTRICTA: El socio solamente puede eliminar sus propios ejercicios
-    if not ej_existente.get("id_socio") or int(ej_existente["id_socio"]) != int(id_socio):
+    ej_existente = _fetch_ejercicio_socio_or_404(db, id_ejercicio_socio)
+    if int(ej_existente.get("id_socio") or 0) != own_socio_id:
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,
-            detail="Permiso denegado: No tienes autorización para eliminar ejercicios oficiales del gimnasio.",
+            detail="No tienes autorización para eliminar ejercicios personales de otro socio.",
         )
 
-    # 3. Limpiar dependencias en rutinas antes de eliminar
-    supabase.from_("rutina_ejercicio").delete().eq("id_ejercicio", id).execute()
-
-    res_del = supabase.from_("ejercicio").delete().eq("id_ejercicio", id).execute()
-    if not res_del.data:
+    res_uso = (
+        db.from_("rutina_ejercicio_socio")
+        .select("id_rutina_ejercicio_socio")
+        .eq("id_ejercicio_socio", id_ejercicio_socio)
+        .eq("id_socio", own_socio_id)
+        .execute()
+    )
+    usos = get_data(res_uso) or []
+    if isinstance(usos, list) and len(usos) > 0:
         raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail="Error al eliminar el ejercicio propio.",
+            status_code=status.HTTP_409_CONFLICT,
+            detail=f"No se puede eliminar el ejercicio porque está en uso en {len(usos)} rutina(s) personal(es). Retíralo primero o desactívalo.",
         )
+
+    res_del = (
+        db.from_("ejercicio_socio")
+        .delete()
+        .eq("id_ejercicio_socio", id_ejercicio_socio)
+        .eq("id_socio", own_socio_id)
+        .execute()
+    )
+    rows = get_data(res_del) or []
+    if not rows:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Ejercicio personal no encontrado.")
 
     return {
-        "mensaje": f"El ejercicio propio \"{ej_existente.get('nombre')}\" fue eliminado exitosamente."
+        "mensaje": f'El ejercicio personal "{ej_existente.get("nombre")}" fue eliminado exitosamente.',
     }

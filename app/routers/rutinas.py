@@ -1,840 +1,1063 @@
-import json
 from datetime import date
 from typing import Optional, Dict, Any, List
-from fastapi import APIRouter, HTTPException, status, Query, Path, Depends
-from app.config import supabase
-from app.core.dependencies import get_optional_user
+from fastapi import APIRouter, HTTPException, status, Query, Path, Depends, Body
+from supabase import Client
+
+from app.core.dependencies import get_current_user
 from app.services.utils import get_data
 from app.models.rutina import (
-    RutinaCreate,
-    RutinaUpdate,
-    RutinaAdoptar,
-    RutinaEjercicioAdd,
+    RutinaSocioCreate,
+    RutinaSocioUpdate,
+    RutinaEjercicioSocioAdd,
     RutinaEjercicioUpdate,
+    RutinaGimnasioCreate,
+    RutinaGimnasioUpdate,
+    RutinaEjercicioGimnasioAdd,
+    RutinaReordenarRequest,
+    RutinaAsignarRequest,
+    RutinaReasignarResponsableRequest,
+    RutinaFinalizarAsignacionRequest,
+)
+from app.routers.gimnasios import ensure_active_organizational_assignments
+from app.routers.socios import (
+    _resolve_socio_profile_context,
+    _fetch_socio_gimnasios_for_socio,
+)
+from app.routers.ejercicios import (
+    EJERCICIO_GIMNASIO_COLUMNS,
+    EJERCICIO_SOCIO_COLUMNS,
+    verify_can_manage_gym_training,
 )
 
-router = APIRouter(prefix="/api/rutinas", tags=["Rutinas"])
+router = APIRouter(prefix="/api/rutinas", tags=["Rutinas Personales, del Gimnasio y Asignaciones"])
+
+RUTINA_SOCIO_SELECT = (
+    "id_rutina_socio, id_socio, nombre, descripcion, fecha_inicio, fecha_fin, estado, creado_en, "
+    "rutina_ejercicio_socio(id_rutina_ejercicio_socio, id_rutina_socio, id_socio, id_ejercicio_socio, "
+    "series, repeticiones, peso, descanso, orden, "
+    "ejercicio_socio(id_ejercicio_socio, id_socio, nombre, descripcion, grupo_muscular, dificultad, estado))"
+)
+
+RUTINA_GIMNASIO_SELECT = (
+    "id_rutina_gimnasio, id_gimnasio, nombre, descripcion, nivel, estado, creado_en, "
+    "rutina_ejercicio_gimnasio(id_rutina_ejercicio_gimnasio, id_rutina_gimnasio, id_gimnasio, id_ejercicio_gimnasio, "
+    "series, repeticiones, peso, descanso, orden, "
+    "ejercicio_gimnasio(id_ejercicio_gimnasio, id_gimnasio, nombre, descripcion, grupo_muscular, dificultad, estado))"
+)
+
+ASIGNACION_SELECT = (
+    "id_rutina_asignada, id_rutina_gimnasio, id_socio_gimnasio, id_gimnasio, "
+    "id_empleado_responsable, fecha_asignacion, fecha_finalizacion, estado, observaciones, creado_en, "
+    "rutina_gimnasio(id_rutina_gimnasio, id_gimnasio, nombre, descripcion, nivel, estado, "
+    "rutina_ejercicio_gimnasio(id_rutina_ejercicio_gimnasio, id_ejercicio_gimnasio, series, repeticiones, peso, descanso, orden, "
+    "ejercicio_gimnasio(id_ejercicio_gimnasio, nombre, grupo_muscular, dificultad, descripcion))), "
+    "socio_gimnasio(id_socio_gimnasio, id_socio, id_gimnasio, estado, "
+    "socio(id_socio, nombre, apellido, dni, email)), "
+    "empleado(id_empleado, nombre, apellido, email, estado)"
+)
 
 
-def enriquecer_ejercicios_rutina(rutina_ejercicios: Optional[List[Dict[str, Any]]]) -> List[Dict[str, Any]]:
-    """Enriquecer listado de ejercicios asociados con origen ('Gimnasio' vs 'Mi ejercicio')."""
-    if not rutina_ejercicios or not isinstance(rutina_ejercicios, list):
-        return []
-    enriquecidos = []
-    for re_item in rutina_ejercicios:
-        ej = re_item.get("ejercicio") or {}
-        es_propio = bool(ej.get("id_socio"))
-        enriquecidos.append({
-            **re_item,
-            "origen": "Mi ejercicio" if es_propio else "Gimnasio",
-            "tipo_origen": "propio" if es_propio else "gimnasio",
-            "es_propio": es_propio,
-            "es_gimnasio": not es_propio,
-        })
-    return enriquecidos
+def _map_rutina_rpc_error(exc: Exception) -> int:
+    msg = str(exc).lower()
+    if any(k in msg for k in ("ya se encuentra asignada", "ya finalizada", "duplicad")):
+        return status.HTTP_409_CONFLICT
+    if any(k in msg for k in ("no tienes autorización", "sin permisos", "no autorizado", "no autorizados")):
+        return status.HTTP_403_FORBIDDEN
+    if "no existe" in msg or "no encontrada" in msg:
+        return status.HTTP_404_NOT_FOUND
+    return status.HTTP_400_BAD_REQUEST
 
 
-# 1. Catálogo de Rutinas Ofrecidas por el Gimnasio (Programas Oficiales)
-@router.get("/gym/ofrecidas", status_code=status.HTTP_200_OK)
-@router.get("/ofrecidas-gym", status_code=status.HTTP_200_OK)
-@router.get("/ofrecidas", status_code=status.HTTP_200_OK)
-async def get_rutinas_ofrecidas_gym(
-    current_user: Optional[Dict[str, Any]] = Depends(get_optional_user),
-):
-    """Devuelve las plantillas y programas oficiales recomendados por el gimnasio con ejercicios enlazados."""
-    gym_id = current_user.get("id_gimnasio") if current_user else None
+def _sort_rutina_items(rutina: Dict[str, Any], key: str) -> Dict[str, Any]:
+    out = dict(rutina)
+    items = out.get(key)
+    if isinstance(items, list):
+        out[key] = sorted(items, key=lambda x: int(x.get("orden") or 0))
+    else:
+        out[key] = []
+    return out
 
-    # Consultar ejercicios oficiales del gimnasio para vincularlos con las plantillas
-    ej_query = (
-        supabase.from_("ejercicio")
-        .select("id_ejercicio, nombre, grupo_muscular, dificultad, descripcion")
-        .is_("id_socio", "null")
+
+def _fetch_rutina_socio_or_404(db: Client, id_rutina_socio: int) -> Dict[str, Any]:
+    res = (
+        db.from_("rutina_socio")
+        .select(RUTINA_SOCIO_SELECT)
+        .eq("id_rutina_socio", id_rutina_socio)
+        .maybe_single()
+        .execute()
     )
-    if gym_id:
-        ej_query = ej_query.or_(f"id_gimnasio.eq.{gym_id},id_gimnasio.is.null")
-
-    res_ej = ej_query.limit(100).execute()
-    lista_ej = res_ej.data or []
-
-    def encontrar_ej(nombre_parcial: str, musculo: Optional[str] = None):
-        for e in lista_ej:
-            if nombre_parcial.lower() in (e.get("nombre") or "").lower():
-                return e
-        if musculo:
-            for e in lista_ej:
-                if (e.get("grupo_muscular") or "").lower() == musculo.lower():
-                    return e
-        return lista_ej[0] if lista_ej else None
-
-    programas_gym = [
-        {
-            "id_plantilla": "gym-fullbody-intro",
-            "nombre": "Full Body: Acondicionamiento & Fuerza Integral",
-            "tipo": "Full Body",
-            "dificultad": "Principiante",
-            "duracion": "50 min",
-            "dias": "Lunes, Miércoles, Viernes",
-            "objetivo": "Acondicionamiento físico, ganancia de fuerza inicial y adaptación neuromuscular.",
-            "notas": "Ideal para quienes inician o retoman el gimnasio. Realizar calentamiento previo de 5 a 10 min.",
-            "nivel_badge": "Principiante",
-            "frecuencia": "3 días por semana",
-            "ejercicios_plantilla": [
-                {"query": "Sentadilla", "musculo": "Piernas", "series": 3, "repeticiones": 12, "peso": 20, "descanso": 60},
-                {"query": "banca plano", "musculo": "Pecho", "series": 3, "repeticiones": 10, "peso": 30, "descanso": 75},
-                {"query": "Jalón al pecho", "musculo": "Espalda", "series": 3, "repeticiones": 12, "peso": 35, "descanso": 60},
-                {"query": "Press militar", "musculo": "Hombros", "series": 3, "repeticiones": 10, "peso": 12, "descanso": 60},
-                {"query": "Curl de bíceps", "musculo": "Brazos", "series": 3, "repeticiones": 12, "peso": 15, "descanso": 45},
-                {"query": "Plancha", "musculo": "Abdomen", "series": 3, "repeticiones": 30, "peso": 0, "descanso": 45},
-            ],
-        },
-        {
-            "id_plantilla": "gym-torso-pierna",
-            "nombre": "Torso / Pierna: Hipertrofia & Rendimiento",
-            "tipo": "Torso - Pierna",
-            "dificultad": "Intermedia",
-            "duracion": "65 min",
-            "dias": "Lunes, Martes, Jueves, Viernes",
-            "objetivo": "Maximizar el crecimiento muscular con balance perfecto entre volumen y recuperación.",
-            "notas": "Separar los días de torso y pierna para permitir la recuperación muscular adecuada.",
-            "nivel_badge": "Intermedio",
-            "frecuencia": "4 días por semana",
-            "ejercicios_plantilla": [
-                {"query": "banca plano", "musculo": "Pecho", "series": 4, "repeticiones": 8, "peso": 50, "descanso": 90},
-                {"query": "Remo con barra", "musculo": "Espalda", "series": 4, "repeticiones": 10, "peso": 45, "descanso": 75},
-                {"query": "Press inclinado", "musculo": "Pecho", "series": 3, "repeticiones": 12, "peso": 20, "descanso": 60},
-                {"query": "Dominadas", "musculo": "Espalda", "series": 3, "repeticiones": 8, "peso": 0, "descanso": 90},
-                {"query": "Sentadilla", "musculo": "Piernas", "series": 4, "repeticiones": 10, "peso": 60, "descanso": 90},
-                {"query": "Prensa de piernas", "musculo": "Piernas", "series": 4, "repeticiones": 12, "peso": 100, "descanso": 75},
-                {"query": "Extensiones de cuádriceps", "musculo": "Piernas", "series": 3, "repeticiones": 15, "peso": 40, "descanso": 60},
-                {"query": "Curl femoral", "musculo": "Piernas", "series": 3, "repeticiones": 12, "peso": 35, "descanso": 60},
-            ],
-        },
-        {
-            "id_plantilla": "gym-ppl-elite",
-            "nombre": "Push / Pull / Legs (PPL): Élite Muscular",
-            "tipo": "Push - Pull - Legs",
-            "dificultad": "Avanzada",
-            "duracion": "70 min",
-            "dias": "Lunes a Viernes",
-            "objetivo": "Enfoque biomecánico en empujes, jalones y piernas para atletas comprometidos.",
-            "notas": "Controlar la fase excéntrica del movimiento (2-3 segundos) para máximo reclutamiento.",
-            "nivel_badge": "Avanzado",
-            "frecuencia": "5 días por semana",
-            "ejercicios_plantilla": [
-                {"query": "banca plano", "musculo": "Pecho", "series": 4, "repeticiones": 8, "peso": 65, "descanso": 90},
-                {"query": "Press militar", "musculo": "Hombros", "series": 4, "repeticiones": 10, "peso": 22, "descanso": 75},
-                {"query": "Aperturas en polea", "musculo": "Pecho", "series": 3, "repeticiones": 15, "peso": 15, "descanso": 60},
-                {"query": "Extensiones de tríceps", "musculo": "Brazos", "series": 4, "repeticiones": 12, "peso": 25, "descanso": 45},
-                {"query": "Dominadas", "musculo": "Espalda", "series": 4, "repeticiones": 8, "peso": 0, "descanso": 90},
-                {"query": "Remo con barra", "musculo": "Espalda", "series": 4, "repeticiones": 10, "peso": 55, "descanso": 75},
-                {"query": "Curl de bíceps", "musculo": "Brazos", "series": 4, "repeticiones": 12, "peso": 20, "descanso": 60},
-                {"query": "Sentadilla", "musculo": "Piernas", "series": 4, "repeticiones": 8, "peso": 75, "descanso": 120},
-            ],
-        },
-        {
-            "id_plantilla": "gym-fatburn-hiit",
-            "nombre": "Quema de Grasa & HIIT Funcional",
-            "tipo": "Funcional & HIIT",
-            "dificultad": "Intermedia",
-            "duracion": "45 min",
-            "dias": "Lunes, Miércoles, Viernes",
-            "objetivo": "Acelerar el metabolismo basal, elevar pulsaciones y tonificar cuerpo completo.",
-            "notas": "Descansos cortos y dinámicos para optimizar el consumo de oxígeno post-entrenamiento (EPOC).",
-            "nivel_badge": "Dinámico",
-            "frecuencia": "3 días por semana",
-            "ejercicios_plantilla": [
-                {"query": "Sentadilla", "musculo": "Piernas", "series": 4, "repeticiones": 15, "peso": 20, "descanso": 45},
-                {"query": "banca plano", "musculo": "Pecho", "series": 4, "repeticiones": 12, "peso": 25, "descanso": 45},
-                {"query": "Jalón al pecho", "musculo": "Espalda", "series": 4, "repeticiones": 12, "peso": 30, "descanso": 45},
-                {"query": "Elevaciones laterales", "musculo": "Hombros", "series": 3, "repeticiones": 15, "peso": 8, "descanso": 30},
-                {"query": "Plancha", "musculo": "Abdomen", "series": 4, "repeticiones": 40, "peso": 0, "descanso": 30},
-            ],
-        },
-        {
-            "id_plantilla": "gym-strength-5x5",
-            "nombre": "Fuerza Bruta 5×5 Powerlifting",
-            "tipo": "Fuerza Pura",
-            "dificultad": "Avanzada",
-            "duracion": "60 min",
-            "dias": "Lunes, Miércoles, Viernes",
-            "objetivo": "Desarrollo de fuerza máxima en movimientos multiarticulares con progresión lineal.",
-            "notas": "5 series de 5 repeticiones efectivas con 80-85% del 1RM. Descansos largos de 2 a 3 minutos.",
-            "nivel_badge": "Fuerza",
-            "frecuencia": "3 días por semana",
-            "ejercicios_plantilla": [
-                {"query": "Sentadilla", "musculo": "Piernas", "series": 5, "repeticiones": 5, "peso": 80, "descanso": 120},
-                {"query": "banca plano", "musculo": "Pecho", "series": 5, "repeticiones": 5, "peso": 70, "descanso": 120},
-                {"query": "Remo con barra", "musculo": "Espalda", "series": 5, "repeticiones": 5, "peso": 60, "descanso": 120},
-                {"query": "Press militar", "musculo": "Hombros", "series": 5, "repeticiones": 5, "peso": 40, "descanso": 90},
-            ],
-        },
-        {
-            "id_plantilla": "gym-gluteos-piernas",
-            "nombre": "Glúteos & Tren Inferior Esculpido",
-            "tipo": "Piernas & Glúteos",
-            "dificultad": "Intermedia",
-            "duracion": "55 min",
-            "dias": "Martes, Jueves, Sábado",
-            "objetivo": "Focalización en desarrollo de glúteos, isquiosurales, cuádriceps y abdomen firme.",
-            "notas": "Concentrarse en la contracción en el punto máximo y tensión mecánica constante.",
-            "nivel_badge": "Especializado",
-            "frecuencia": "3 días por semana",
-            "ejercicios_plantilla": [
-                {"query": "Sentadilla", "musculo": "Piernas", "series": 4, "repeticiones": 10, "peso": 40, "descanso": 90},
-                {"query": "Prensa de piernas", "musculo": "Piernas", "series": 4, "repeticiones": 12, "peso": 80, "descanso": 75},
-                {"query": "Extensiones de cuádriceps", "musculo": "Piernas", "series": 3, "repeticiones": 15, "peso": 30, "descanso": 60},
-                {"query": "Curl femoral", "musculo": "Piernas", "series": 4, "repeticiones": 12, "peso": 25, "descanso": 60},
-                {"query": "Plancha", "musculo": "Abdomen", "series": 3, "repeticiones": 45, "peso": 0, "descanso": 45},
-            ],
-        },
-    ]
-
-    programas_completos = []
-    for prog in programas_gym:
-        ejercicios_asociados = []
-        for idx, item in enumerate(prog["ejercicios_plantilla"]):
-            ej_db = encontrar_ej(item["query"], item["musculo"])
-            ejercicios_asociados.append({
-                "id_ejercicio": ej_db["id_ejercicio"] if ej_db else idx + 1,
-                "nombre": ej_db["nombre"] if ej_db else f"{item['query']} oficial",
-                "grupo_muscular": ej_db["grupo_muscular"] if ej_db else item["musculo"],
-                "dificultad": ej_db["dificultad"] if ej_db else prog["dificultad"],
-                "descripcion": ej_db["descripcion"] if ej_db else "Ejercicio oficial recomendado por el gimnasio",
-                "series": item["series"],
-                "repeticiones": item["repeticiones"],
-                "peso": item["peso"],
-                "descanso": item["descanso"],
-                "orden": idx + 1,
-            })
-
-        programas_completos.append({
-            "id_plantilla": prog["id_plantilla"],
-            "nombre": prog["nombre"],
-            "tipo": prog["tipo"],
-            "dificultad": prog["dificultad"],
-            "duracion": prog["duracion"],
-            "dias": prog["dias"],
-            "objetivo": prog["objetivo"],
-            "notas": prog["notas"],
-            "nivel_badge": prog["nivel_badge"],
-            "frecuencia": prog["frecuencia"],
-            "es_ofrecida_gym": True,
-            "total_ejercicios": len(ejercicios_asociados),
-            "ejercicios": ejercicios_asociados,
-        })
-
-    return programas_completos
+    row = get_data(res)
+    if not isinstance(row, dict):
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Rutina personal no encontrada.")
+    return _sort_rutina_items(row, "rutina_ejercicio_socio")
 
 
-# 2. Adoptar / Comenzar una Rutina del Gimnasio
-@router.post("/adoptar", status_code=status.HTTP_201_CREATED)
-@router.post("/adoptar-gym", status_code=status.HTTP_201_CREATED)
-async def adoptar_rutina_gym(
-    req: RutinaAdoptar,
-    current_user: Optional[Dict[str, Any]] = Depends(get_optional_user),
+def _fetch_rutina_gimnasio_or_404(db: Client, id_rutina_gimnasio: int) -> Dict[str, Any]:
+    res = (
+        db.from_("rutina_gimnasio")
+        .select(RUTINA_GIMNASIO_SELECT)
+        .eq("id_rutina_gimnasio", id_rutina_gimnasio)
+        .maybe_single()
+        .execute()
+    )
+    row = get_data(res)
+    if not isinstance(row, dict):
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Rutina de gimnasio no encontrada.")
+    return _sort_rutina_items(row, "rutina_ejercicio_gimnasio")
+
+
+def _fetch_asignacion_or_404(db: Client, id_rutina_asignada: int) -> Dict[str, Any]:
+    res = (
+        db.from_("rutinas_asignadas_socio_gimnasio")
+        .select(ASIGNACION_SELECT)
+        .eq("id_rutina_asignada", id_rutina_asignada)
+        .maybe_single()
+        .execute()
+    )
+    row = get_data(res)
+    if not isinstance(row, dict):
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Asignación de rutina no encontrada.")
+    return row
+
+
+# ==============================================================================
+# 1. RUTINAS PERSONALES DEL SOCIO (`public.rutina_socio`)
+# ==============================================================================
+
+@router.get("/personales", status_code=status.HTTP_200_OK)
+async def listar_rutinas_personales(
+    solo_activas: bool = Query(default=False),
+    current_user: Dict[str, Any] = Depends(get_current_user),
 ):
-    """Permite al socio adoptar una rutina recomendada del catálogo del gimnasio."""
-    target_socio_id = req.id_socio or (current_user.get("id_socio") if current_user else None)
+    """Lista las rutinas personales (`public.rutina_socio`) del socio autenticado."""
+    socio_ctx = _resolve_socio_profile_context(current_user)
+    own_socio_id = int(socio_ctx["id_socio"])
+    db: Client = socio_ctx["supabase"]
 
-    if not target_socio_id and current_user and current_user.get("id_usuario"):
-        res_s = (
-            supabase.from_("socio")
-            .select("id_socio, id_gimnasio")
-            .eq("id_usuario", current_user["id_usuario"])
-            .maybe_single()
-            .execute()
+    res = (
+        db.from_("rutina_socio")
+        .select(RUTINA_SOCIO_SELECT)
+        .eq("id_socio", own_socio_id)
+        .order("id_rutina_socio", desc=True)
+        .execute()
+    )
+    rows = get_data(res) or []
+    rutinas = [
+        _sort_rutina_items(r, "rutina_ejercicio_socio")
+        for r in (rows if isinstance(rows, list) else [])
+        if isinstance(r, dict)
+        and int(r.get("id_socio") or 0) == own_socio_id
+        and (not solo_activas or r.get("estado") is True)
+    ]
+    return {"id_socio": own_socio_id, "total": len(rutinas), "rutinas": rutinas}
+
+
+@router.get("/personales/{id_rutina_socio}", status_code=status.HTTP_200_OK)
+async def obtener_rutina_personal(
+    id_rutina_socio: int = Path(..., gt=0),
+    current_user: Dict[str, Any] = Depends(get_current_user),
+):
+    """Obtiene una rutina personal validando propiedad exclusiva del socio."""
+    socio_ctx = _resolve_socio_profile_context(current_user)
+    own_socio_id = int(socio_ctx["id_socio"])
+    rutina = _fetch_rutina_socio_or_404(socio_ctx["supabase"], id_rutina_socio)
+    if int(rutina.get("id_socio") or 0) != own_socio_id:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="No tienes autorización para consultar una rutina personal ajena.",
         )
-        soc_data = get_data(res_s)
-        if soc_data:
-            target_socio_id = soc_data.get("id_socio")
+    return {"rutina": rutina}
 
-    if not target_socio_id:
+
+@router.post("/personales", status_code=status.HTTP_201_CREATED)
+async def crear_rutina_personal(
+    req: RutinaSocioCreate,
+    current_user: Dict[str, Any] = Depends(get_current_user),
+):
+    """Crea una rutina personal en `public.rutina_socio` estrictamente para el socio autenticado."""
+    socio_ctx = _resolve_socio_profile_context(current_user)
+    own_socio_id = int(socio_ctx["id_socio"])
+    if req.id_socio is not None and str(req.id_socio).strip() != str(own_socio_id):
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="No puedes crear rutinas personales para otro socio.",
+        )
+
+    if req.fecha_inicio and req.fecha_fin and req.fecha_fin < req.fecha_inicio:
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
-            detail="Se requiere el ID del socio para adoptar la rutina.",
+            detail="La fecha_fin no puede ser anterior a fecha_inicio.",
         )
 
-    plan = req.plantilla
-    if not plan and req.id_plantilla:
-        # Si vino el ID de la plantilla, consultar el catálogo oficial
-        catalogo = await get_rutinas_ofrecidas_gym(current_user)
-        plan = next((p for p in catalogo if p["id_plantilla"] == req.id_plantilla), None)
-
-    if not plan:
-        plan = {
-            "nombre": req.nombre_personalizado or "Rutina Adoptada del Gimnasio",
-            "tipo": "Full Body",
-            "dificultad": "Intermedia",
-            "duracion": "60 min",
-            "dias": "Lunes, Miércoles, Viernes",
-            "objetivo": "Plan de entrenamiento sugerido por el gimnasio",
-            "notas": "Adoptada del catálogo de rutinas del gimnasio.",
-            "ejercicios": [],
-        }
-
-    # Obtener gimnasio del socio
-    res_soc = (
-        supabase.from_("socio")
-        .select("id_gimnasio")
-        .eq("id_socio", target_socio_id)
-        .maybe_single()
-        .execute()
-    )
-    socio_db = get_data(res_soc)
-    gym_id = (socio_db.get("id_gimnasio") if socio_db else None) or (current_user.get("id_gimnasio") if current_user else None)
-
-    # Desactivar cualquier otra rutina activa previa del socio
-    supabase.from_("rutina").update({"estado": "asignada"}).eq("id_socio", target_socio_id).eq("estado", "activa").execute()
-
-    meta_descripcion = json.dumps({
-        "tipo": plan.get("tipo", "Full Body"),
-        "dificultad": plan.get("dificultad", "Intermedia"),
-        "duracion": plan.get("duracion", "60 min"),
-        "dias": plan.get("dias", "Lunes, Miércoles, Viernes"),
-        "notas": plan.get("notas", "Plan adoptado del gimnasio."),
-        "objetivo": plan.get("objetivo", ""),
-        "origen_oficial_gym": True,
-    })
-
-    nueva_rutina = {
-        "nombre": (req.nombre_personalizado or plan.get("nombre") or "Mi Rutina del Gimnasio").strip(),
-        "descripcion": meta_descripcion,
-        "id_socio": target_socio_id,
-        "id_gimnasio": gym_id,
-        "fecha_inicio": date.today().isoformat(),
-        "estado": "activa",
-    }
-
-    res_ins = supabase.from_("rutina").insert([nueva_rutina]).execute()
-    if not res_ins.data:
-        raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail="Error al crear la rutina para el socio.")
-
-    rutina_creada = res_ins.data[0]
-    id_rutina_nueva = rutina_creada["id_rutina"]
-
-    ejercicios_para_insertar = plan.get("ejercicios") or []
-    asociados = []
-
-    for i, item in enumerate(ejercicios_para_insertar):
-        id_ej = item.get("id_ejercicio")
-        if id_ej:
-            insert_ej = {
-                "id_rutina": id_rutina_nueva,
-                "id_ejercicio": int(id_ej),
-                "series": int(item.get("series") or 4),
-                "repeticiones": int(item.get("repeticiones") or 10),
-                "peso": float(item.get("peso") or 0.0),
-                "descanso": int(item.get("descanso") or 60),
-                "orden": i + 1,
-            }
-            try:
-                res_re = (
-                    supabase.from_("rutina_ejercicio")
-                    .insert([insert_ej])
-                    .execute()
-                )
-                if res_re.data:
-                    id_re = res_re.data[0]["id_rutina_ejercicio"]
-                    res_item_full = (
-                        supabase.from_("rutina_ejercicio")
-                        .select("""
-                            id_rutina_ejercicio,
-                            id_ejercicio,
-                            series,
-                            repeticiones,
-                            peso,
-                            descanso,
-                            orden,
-                            ejercicio (
-                                id_ejercicio,
-                                nombre,
-                                grupo_muscular,
-                                dificultad
-                            )
-                        """)
-                        .eq("id_rutina_ejercicio", id_re)
-                        .maybe_single()
-                        .execute()
-                    )
-                    item_full = get_data(res_item_full)
-                    if item_full:
-                        asociados.append(item_full)
-            except Exception:
-                pass
-
-    rutina_creada["rutina_ejercicio"] = asociados
-
-    return {
-        "mensaje": "¡Rutina adoptada con éxito! Ya está configurada como tu rutina activa.",
-        "rutina": rutina_creada,
-    }
-
-
-# 3. Activar Rutina (Establecer como la principal del socio)
-@router.patch("/{id}/activar", status_code=status.HTTP_200_OK)
-@router.put("/{id}/activar", status_code=status.HTTP_200_OK)
-@router.post("/{id}/activar", status_code=status.HTTP_200_OK)
-async def activar_rutina(id: int = Path(...)):
-    """Activa una rutina específica y pasa a estado 'asignada' cualquier otra rutina previa del socio."""
-    res_r = (
-        supabase.from_("rutina")
-        .select("id_rutina, id_socio")
-        .eq("id_rutina", id)
-        .maybe_single()
-        .execute()
-    )
-    rutina = get_data(res_r)
-    if not rutina:
-        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="La rutina especificada no existe.")
-
-    socio_id = rutina.get("id_socio")
-
-    if socio_id:
-        supabase.from_("rutina").update({"estado": "asignada"}).eq("id_socio", socio_id).eq("estado", "activa").execute()
-
-    res_act = (
-        supabase.from_("rutina")
-        .update({"estado": "activa"})
-        .eq("id_rutina", id)
-        .execute()
-    )
-    if not res_act.data:
-        raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail="Error al activar la rutina.")
-
-    res_full = (
-        supabase.from_("rutina")
-        .select("""
-            id_rutina,
-            nombre,
-            descripcion,
-            estado,
-            id_socio,
-            rutina_ejercicio (
-                id_rutina_ejercicio,
-                id_ejercicio,
-                series,
-                repeticiones,
-                peso,
-                descanso,
-                orden,
-                ejercicio (
-                    id_ejercicio,
-                    nombre,
-                    grupo_muscular,
-                    dificultad
-                )
-            )
-        """)
-        .eq("id_rutina", id)
-        .single()
-        .execute()
-    )
-
-    activada = res_full.data
-    if activada:
-        activada["rutina_ejercicio"] = enriquecer_ejercicios_rutina(activada.get("rutina_ejercicio"))
-
-    return {
-        "mensaje": "¡Rutina activada correctamente! Se mostrará en tu panel principal de entrenamiento.",
-        "rutina": activada,
-    }
-
-
-# 4. Obtener todas las rutinas con socio y ejercicios asociados
-@router.get("", status_code=status.HTTP_200_OK)
-async def get_all_rutinas(
-    search: Optional[str] = Query(None),
-    id_socio: Optional[str] = Query(None),
-    estado: Optional[str] = Query(None),
-    current_user: Optional[Dict[str, Any]] = Depends(get_optional_user),
-):
-    """Obtener todas las rutinas con socio y ejercicios asociados enriquecidos."""
-    # Si el usuario es socio y no especifica id_socio, filtrar automáticamente por su socio
-    if not id_socio and current_user and current_user.get("rol") == "socio" and current_user.get("id_socio"):
-        id_socio = str(current_user["id_socio"])
-
-    query = (
-        supabase.from_("rutina")
-        .select("""
-            id_rutina,
-            nombre,
-            descripcion,
-            fecha_inicio,
-            fecha_fin,
-            estado,
-            id_socio,
-            id_gimnasio,
-            socio (
-                id_socio,
-                nombre,
-                apellido,
-                dni,
-                id_gimnasio
-            ),
-            rutina_ejercicio (
-                id_rutina_ejercicio,
-                id_ejercicio,
-                series,
-                repeticiones,
-                peso,
-                descanso,
-                orden,
-                ejercicio (
-                    id_ejercicio,
-                    nombre,
-                    grupo_muscular,
-                    dificultad,
-                    descripcion,
-                    id_gimnasio,
-                    id_socio
-                )
-            )
-        """)
-        .order("id_rutina", desc=True)
-    )
-
-    if id_socio and id_socio.lower() != "todos":
-        try:
-            query = query.eq("id_socio", int(id_socio))
-        except ValueError:
-            pass
-
-    if estado and estado.lower() != "todos":
-        query = query.eq("estado", estado)
-
-    if search and search.strip():
-        query = query.ilike("nombre", f"%{search.strip()}%")
-
-    res = query.execute()
-    rutinas_raw = res.data or []
-
-    # Enriquecer y ordenar ejercicios de cada rutina
-    rutinas_formateadas = []
-    for r in rutinas_raw:
-        re_list = r.get("rutina_ejercicio")
-        ejercicios = enriquecer_ejercicios_rutina(re_list)
-        ejercicios.sort(key=lambda x: x.get("orden") or 0)
-        rutinas_formateadas.append({
-            **r,
-            "rutina_ejercicio": ejercicios,
-        })
-
-    # Ordenar para que la rutina activa aparezca en primer lugar
-    rutinas_formateadas.sort(
-        key=lambda x: (
-            0 if x.get("estado") == "activa" else 1,
-            -(x.get("id_rutina") or 0)
-        )
-    )
-
-    return rutinas_formateadas
-
-
-# 5. Obtener rutina por ID junto a sus ejercicios completos
-@router.get("/{id}", status_code=status.HTTP_200_OK)
-async def get_rutina_by_id(id: int = Path(...)):
-    """Obtener detalle de rutina por ID enriquecido con sus ejercicios."""
-    res = (
-        supabase.from_("rutina")
-        .select("""
-            id_rutina,
-            nombre,
-            descripcion,
-            fecha_inicio,
-            fecha_fin,
-            estado,
-            id_socio,
-            id_gimnasio,
-            socio (
-                id_socio,
-                nombre,
-                apellido,
-                dni,
-                id_gimnasio
-            ),
-            rutina_ejercicio (
-                id_rutina_ejercicio,
-                id_ejercicio,
-                series,
-                repeticiones,
-                peso,
-                descanso,
-                orden,
-                ejercicio (
-                    id_ejercicio,
-                    nombre,
-                    grupo_muscular,
-                    dificultad,
-                    descripcion,
-                    id_gimnasio,
-                    id_socio
-                )
-            )
-        """)
-        .eq("id_rutina", id)
-        .maybe_single()
-        .execute()
-    )
-
-    data = get_data(res)
-    if not data:
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
-            detail=f"Rutina con ID {id} no encontrada.",
-        )
-
-    data["rutina_ejercicio"] = enriquecer_ejercicios_rutina(data.get("rutina_ejercicio"))
-    data["rutina_ejercicio"].sort(key=lambda x: x.get("orden") or 0)
-
-    return data
-
-
-# 6. Crear una nueva rutina
-@router.post("", status_code=status.HTTP_201_CREATED)
-async def create_rutina(
-    req: RutinaCreate,
-    current_user: Optional[Dict[str, Any]] = Depends(get_optional_user),
-):
-    """Crear una nueva rutina."""
-    if not req.nombre or not req.nombre.strip():
+    clean_nombre = req.nombre.strip()
+    if not clean_nombre:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="El nombre de la rutina es obligatorio.")
 
-    socio_asignado = req.id_socio
-    if not socio_asignado and current_user and current_user.get("rol") == "socio" and current_user.get("id_socio"):
-        socio_asignado = current_user["id_socio"]
-
-    gym_id = current_user.get("id_gimnasio") if current_user else None
-    if socio_asignado and not gym_id:
-        res_s = (
-            supabase.from_("socio")
-            .select("id_gimnasio")
-            .eq("id_socio", socio_asignado)
-            .maybe_single()
-            .execute()
-        )
-        s_data = get_data(res_s)
-        if s_data:
-            gym_id = s_data.get("id_gimnasio")
-
-    desc_val = req.descripcion
-    if isinstance(desc_val, (dict, list)):
-        desc_val = json.dumps(desc_val)
-    elif desc_val:
-        desc_val = str(desc_val).strip()
-
-    nueva_rutina = {
-        "nombre": req.nombre.strip(),
-        "descripcion": desc_val,
-        "id_socio": socio_asignado,
-        "id_gimnasio": gym_id,
+    db: Client = socio_ctx["supabase"]
+    nueva = {
+        "id_socio": own_socio_id,
+        "nombre": clean_nombre,
+        "descripcion": req.descripcion.strip() if req.descripcion and req.descripcion.strip() else None,
         "fecha_inicio": req.fecha_inicio or date.today().isoformat(),
-        "fecha_fin": req.fecha_fin or None,
-        "estado": req.estado or "asignada",
+        "fecha_fin": req.fecha_fin,
+        "estado": bool(req.estado),
     }
+    res = db.from_("rutina_socio").insert([nueva]).execute()
+    rows = get_data(res) or []
+    if not rows:
+        raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail="Error al crear la rutina personal.")
 
-    res = supabase.from_("rutina").insert([nueva_rutina]).execute()
-    if not res.data:
-        raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail="Error al crear rutina.")
-
-    rutina_creada = res.data[0]
-    rutina_creada["rutina_ejercicio"] = []
-    return rutina_creada
+    rutina = _sort_rutina_items(rows[0], "rutina_ejercicio_socio")
+    return {"mensaje": "Rutina personal creada exitosamente.", "rutina": rutina}
 
 
-# 7. Actualizar rutina existente
-@router.put("/{id}", status_code=status.HTTP_200_OK)
-async def update_rutina(
-    id: int = Path(...),
-    req: RutinaUpdate = ...,
+@router.put("/personales/{id_rutina_socio}", status_code=status.HTTP_200_OK)
+async def actualizar_rutina_personal(
+    req: RutinaSocioUpdate,
+    id_rutina_socio: int = Path(..., gt=0),
+    current_user: Dict[str, Any] = Depends(get_current_user),
 ):
-    """Actualizar rutina existente."""
-    update_data = {}
+    """Actualiza una rutina personal en `public.rutina_socio` sin permitir transferencia de propietario."""
+    socio_ctx = _resolve_socio_profile_context(current_user)
+    own_socio_id = int(socio_ctx["id_socio"])
+    if req.id_socio is not None and str(req.id_socio).strip() != str(own_socio_id):
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="No está permitido transferir una rutina personal a otro socio.",
+        )
+
+    db: Client = socio_ctx["supabase"]
+    actual = _fetch_rutina_socio_or_404(db, id_rutina_socio)
+    if int(actual.get("id_socio") or 0) != own_socio_id:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="No tienes autorización para modificar una rutina personal ajena.",
+        )
+
+    update_data: Dict[str, Any] = {}
     if req.nombre is not None:
-        update_data["nombre"] = req.nombre.strip()
+        clean_nombre = req.nombre.strip()
+        if not clean_nombre:
+            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="El nombre no puede estar vacío.")
+        update_data["nombre"] = clean_nombre
     if req.descripcion is not None:
-        if isinstance(req.descripcion, (dict, list)):
-            update_data["descripcion"] = json.dumps(req.descripcion)
-        else:
-            update_data["descripcion"] = str(req.descripcion).strip() if req.descripcion else None
-    if req.id_socio is not None:
-        update_data["id_socio"] = int(req.id_socio) if req.id_socio else None
+        update_data["descripcion"] = req.descripcion.strip() or None
     if req.fecha_inicio is not None:
         update_data["fecha_inicio"] = req.fecha_inicio
     if req.fecha_fin is not None:
         update_data["fecha_fin"] = req.fecha_fin
     if req.estado is not None:
-        update_data["estado"] = req.estado
+        update_data["estado"] = bool(req.estado)
 
-    res = supabase.from_("rutina").update(update_data).eq("id_rutina", id).execute()
-    if not res.data:
-        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=f"No se encontró la rutina {id} para actualizar.")
-
-    return res.data[0]
-
-
-# 8. Eliminar rutina y limpiar dependencias
-@router.delete("/{id}", status_code=status.HTTP_200_OK)
-async def delete_rutina(id: int = Path(...)):
-    """Eliminar rutina y limpiar relaciones de ejercicios."""
-    # 1. Eliminar relaciones en rutina_ejercicio
-    supabase.from_("rutina_ejercicio").delete().eq("id_rutina", id).execute()
-
-    # 2. Eliminar rutina
-    res = supabase.from_("rutina").delete().eq("id_rutina", id).execute()
-    if not res.data:
-        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=f"La rutina {id} no existe.")
-
-    return {"message": f"Rutina {id} eliminada correctamente."}
-
-
-# 9. Endpoints de relación con Ejercicios
-
-@router.get("/{id}/ejercicios", status_code=status.HTTP_200_OK)
-async def get_ejercicios_by_rutina(id: int = Path(...)):
-    """Consultar los ejercicios pertenecientes a una rutina enriquecidos."""
-    res = (
-        supabase.from_("rutina_ejercicio")
-        .select("""
-            id_rutina_ejercicio,
-            id_ejercicio,
-            series,
-            repeticiones,
-            peso,
-            descanso,
-            orden,
-            ejercicio (
-                id_ejercicio,
-                nombre,
-                grupo_muscular,
-                dificultad,
-                descripcion,
-                id_gimnasio,
-                id_socio
-            )
-        """)
-        .eq("id_rutina", id)
-        .order("orden", desc=False)
-        .execute()
-    )
-
-    data = res.data or []
-    return enriquecer_ejercicios_rutina(data)
-
-
-@router.post("/{id}/ejercicios", status_code=status.HTTP_201_CREATED)
-async def add_ejercicio_to_rutina(
-    id: int = Path(...),
-    req: RutinaEjercicioAdd = ...,
-):
-    """Asociar un ejercicio a una rutina."""
-    num_series = req.series or req.serie or 4
-    num_reps = req.repeticiones if req.repeticiones is not None else 12
-    num_peso = float(req.peso) if req.peso is not None else 0.0
-    num_descanso = req.descanso if req.descanso is not None else 60
-    num_orden = req.orden if req.orden is not None else 1
-
-    insert_data = {
-        "id_rutina": id,
-        "id_ejercicio": int(req.id_ejercicio),
-        "series": int(num_series),
-        "repeticiones": int(num_reps),
-        "peso": num_peso,
-        "descanso": int(num_descanso),
-        "orden": int(num_orden),
-    }
-
-    res = (
-        supabase.from_("rutina_ejercicio")
-        .insert([insert_data])
-        .execute()
-    )
-    if not res.data:
+    fi = update_data.get("fecha_inicio", actual.get("fecha_inicio"))
+    ff = update_data.get("fecha_fin", actual.get("fecha_fin"))
+    if fi and ff and str(ff) < str(fi):
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
-            detail="Error al asociar ejercicio a la rutina. Verifica que existan ambos IDs.",
+            detail="La fecha_fin no puede ser anterior a fecha_inicio.",
         )
+    if not update_data:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="No se enviaron campos para actualizar.")
 
-    id_rel = res.data[0]["id_rutina_ejercicio"]
-    res_full = (
-        supabase.from_("rutina_ejercicio")
-        .select("""
-            id_rutina_ejercicio,
-            id_ejercicio,
-            series,
-            repeticiones,
-            peso,
-            descanso,
-            orden,
-            ejercicio (
-                id_ejercicio,
-                nombre,
-                grupo_muscular,
-                dificultad,
-                descripcion,
-                id_gimnasio,
-                id_socio
-            )
-        """)
-        .eq("id_rutina_ejercicio", id_rel)
-        .single()
+    res = (
+        db.from_("rutina_socio")
+        .update(update_data)
+        .eq("id_rutina_socio", id_rutina_socio)
+        .eq("id_socio", own_socio_id)
         .execute()
     )
+    rows = get_data(res) or []
+    if not rows:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Rutina personal no encontrada.")
+    return {"mensaje": "Rutina personal actualizada con éxito.", "rutina": rows[0]}
 
-    item = res_full.data
-    enriquecido = enriquecer_ejercicios_rutina([item])
-    return enriquecido[0] if enriquecido else item
 
-
-@router.put("/{id}/ejercicios/{ejercicio_id}", status_code=status.HTTP_200_OK)
-async def update_ejercicio_en_rutina(
-    id: int = Path(...),
-    ejercicio_id: int = Path(...),
-    req: RutinaEjercicioUpdate = ...,
+@router.delete("/personales/{id_rutina_socio}", status_code=status.HTTP_200_OK)
+async def eliminar_rutina_personal(
+    id_rutina_socio: int = Path(..., gt=0),
+    current_user: Dict[str, Any] = Depends(get_current_user),
 ):
-    """Actualizar parámetros de un ejercicio en una rutina (series, repeticiones, peso, etc.)."""
-    update_data = {}
+    """Elimina una rutina personal del socio autenticado."""
+    socio_ctx = _resolve_socio_profile_context(current_user)
+    own_socio_id = int(socio_ctx["id_socio"])
+    db: Client = socio_ctx["supabase"]
+
+    actual = _fetch_rutina_socio_or_404(db, id_rutina_socio)
+    if int(actual.get("id_socio") or 0) != own_socio_id:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="No tienes autorización para eliminar una rutina personal ajena.",
+        )
+
+    db.from_("rutina_socio").delete().eq("id_rutina_socio", id_rutina_socio).eq("id_socio", own_socio_id).execute()
+    return {"mensaje": f"Rutina personal {id_rutina_socio} eliminada correctamente."}
+
+
+@router.post("/personales/{id_rutina_socio}/ejercicios", status_code=status.HTTP_201_CREATED)
+async def agregar_ejercicio_rutina_personal(
+    req: RutinaEjercicioSocioAdd,
+    id_rutina_socio: int = Path(..., gt=0),
+    current_user: Dict[str, Any] = Depends(get_current_user),
+):
+    """
+    Agrega un ejercicio de `public.ejercicio_socio` a `public.rutina_ejercicio_socio`.
+    Bloquea cualquier intento de mezclar un `ejercicio_gimnasio` o un ejercicio de otro socio.
+    """
+    if req.id_ejercicio_gimnasio is not None:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="No se permite mezclar ejercicios del gimnasio en una rutina personal (`rutina_socio`).",
+        )
+
+    socio_ctx = _resolve_socio_profile_context(current_user)
+    own_socio_id = int(socio_ctx["id_socio"])
+    db: Client = socio_ctx["supabase"]
+
+    rutina = _fetch_rutina_socio_or_404(db, id_rutina_socio)
+    if int(rutina.get("id_socio") or 0) != own_socio_id:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="No tienes autorización para modificar una rutina personal ajena.",
+        )
+
+    res_ej = (
+        db.from_("ejercicio_socio")
+        .select(EJERCICIO_SOCIO_COLUMNS)
+        .eq("id_ejercicio_socio", req.id_ejercicio_socio)
+        .maybe_single()
+        .execute()
+    )
+    ej = get_data(res_ej)
+    if not isinstance(ej, dict) or int(ej.get("id_socio") or 0) != own_socio_id:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="El ejercicio especificado no existe en `ejercicio_socio` o pertenece a otro socio.",
+        )
+
+    # Validar unicidad de ejercicio y orden dentro de la rutina
+    items_actuales = rutina.get("rutina_ejercicio_socio") or []
+    for it in items_actuales:
+        if int(it.get("id_ejercicio_socio") or 0) == req.id_ejercicio_socio:
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail="Este ejercicio personal ya se encuentra en la rutina.",
+            )
+        if int(it.get("orden") or 0) == req.orden:
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail=f"Ya existe un ejercicio en el orden {req.orden} de esta rutina.",
+            )
+
+    nuevo = {
+        "id_rutina_socio": id_rutina_socio,
+        "id_socio": own_socio_id,
+        "id_ejercicio_socio": req.id_ejercicio_socio,
+        "series": int(req.series),
+        "repeticiones": int(req.repeticiones),
+        "peso": round(float(req.peso), 2) if req.peso is not None else 0.0,
+        "descanso": int(req.descanso) if req.descanso is not None else 60,
+        "orden": int(req.orden),
+    }
+    res = db.from_("rutina_ejercicio_socio").insert([nuevo]).execute()
+    rows = get_data(res) or []
+    if not rows:
+        raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail="Error al agregar ejercicio a la rutina personal.")
+    return {"mensaje": "Ejercicio agregado a la rutina personal.", "item": rows[0]}
+
+
+@router.put("/personales/{id_rutina_socio}/ejercicios/{id_item}", status_code=status.HTTP_200_OK)
+async def actualizar_ejercicio_rutina_personal(
+    req: RutinaEjercicioUpdate,
+    id_rutina_socio: int = Path(..., gt=0),
+    id_item: int = Path(..., gt=0),
+    current_user: Dict[str, Any] = Depends(get_current_user),
+):
+    socio_ctx = _resolve_socio_profile_context(current_user)
+    own_socio_id = int(socio_ctx["id_socio"])
+    db: Client = socio_ctx["supabase"]
+
+    rutina = _fetch_rutina_socio_or_404(db, id_rutina_socio)
+    if int(rutina.get("id_socio") or 0) != own_socio_id:
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Sin autorización sobre rutina ajena.")
+
+    update_data: Dict[str, Any] = {}
     if req.series is not None:
         update_data["series"] = int(req.series)
-    elif req.serie is not None:
-        update_data["series"] = int(req.serie)
     if req.repeticiones is not None:
         update_data["repeticiones"] = int(req.repeticiones)
     if req.peso is not None:
-        update_data["peso"] = float(req.peso)
+        update_data["peso"] = round(float(req.peso), 2)
     if req.descanso is not None:
         update_data["descanso"] = int(req.descanso)
     if req.orden is not None:
         update_data["orden"] = int(req.orden)
+    if not update_data:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="No se enviaron campos a actualizar.")
 
-    query = (
-        supabase.from_("rutina_ejercicio")
-        .update(update_data)
-        .eq("id_rutina", id)
-        .or_(f"id_rutina_ejercicio.eq.{ejercicio_id},id_ejercicio.eq.{ejercicio_id}")
-    )
-
-    res = query.execute()
-    if not res.data:
-        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Ejercicio no encontrado en la rutina.")
-
-    return res.data[0]
-
-
-@router.delete("/{id}/ejercicios/{ejercicio_id}", status_code=status.HTTP_200_OK)
-async def remove_ejercicio_from_rutina(
-    id: int = Path(...),
-    ejercicio_id: int = Path(...),
-):
-    """Desvincular ejercicio de una rutina."""
     res = (
-        supabase.from_("rutina_ejercicio")
-        .delete()
-        .eq("id_rutina", id)
-        .or_(f"id_rutina_ejercicio.eq.{ejercicio_id},id_ejercicio.eq.{ejercicio_id}")
+        db.from_("rutina_ejercicio_socio")
+        .update(update_data)
+        .eq("id_rutina_ejercicio_socio", id_item)
+        .eq("id_rutina_socio", id_rutina_socio)
+        .eq("id_socio", own_socio_id)
         .execute()
     )
+    rows = get_data(res) or []
+    if not rows:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Ítem de rutina personal no encontrado.")
+    return {"mensaje": "Ejercicio actualizado en la rutina personal.", "item": rows[0]}
 
-    if not res.data:
-        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="El ejercicio no estaba asociado a esta rutina.")
 
-    return {"message": "Ejercicio desvinculado con éxito de la rutina."}
+@router.delete("/personales/{id_rutina_socio}/ejercicios/{id_item}", status_code=status.HTTP_200_OK)
+async def eliminar_ejercicio_rutina_personal(
+    id_rutina_socio: int = Path(..., gt=0),
+    id_item: int = Path(..., gt=0),
+    current_user: Dict[str, Any] = Depends(get_current_user),
+):
+    socio_ctx = _resolve_socio_profile_context(current_user)
+    own_socio_id = int(socio_ctx["id_socio"])
+    db: Client = socio_ctx["supabase"]
+
+    rutina = _fetch_rutina_socio_or_404(db, id_rutina_socio)
+    if int(rutina.get("id_socio") or 0) != own_socio_id:
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Sin autorización sobre rutina ajena.")
+
+    res = (
+        db.from_("rutina_ejercicio_socio")
+        .delete()
+        .eq("id_rutina_ejercicio_socio", id_item)
+        .eq("id_rutina_socio", id_rutina_socio)
+        .eq("id_socio", own_socio_id)
+        .execute()
+    )
+    rows = get_data(res) or []
+    if not rows:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Ítem de rutina personal no encontrado.")
+    return {"mensaje": "Ejercicio retirado de la rutina personal."}
+
+
+@router.put("/personales/{id_rutina_socio}/reordenar", status_code=status.HTTP_200_OK)
+async def reordenar_rutina_personal(
+    req: RutinaReordenarRequest,
+    id_rutina_socio: int = Path(..., gt=0),
+    current_user: Dict[str, Any] = Depends(get_current_user),
+):
+    """Reordena atómicamente los ejercicios de `rutina_socio` vía `public.rpc_reordenar_rutina_socio_ejercicios`."""
+    socio_ctx = _resolve_socio_profile_context(current_user)
+    own_socio_id = int(socio_ctx["id_socio"])
+    db: Client = socio_ctx["supabase"]
+
+    rutina = _fetch_rutina_socio_or_404(db, id_rutina_socio)
+    if int(rutina.get("id_socio") or 0) != own_socio_id:
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Sin autorización sobre rutina ajena.")
+
+    try:
+        res_rpc = db.rpc(
+            "rpc_reordenar_rutina_socio_ejercicios",
+            {
+                "p_id_rutina_socio": id_rutina_socio,
+                "p_ids_ordenados": [int(x) for x in req.ids_ordenados],
+            },
+        ).execute()
+        reordenados = get_data(res_rpc)
+    except Exception as exc:
+        raise HTTPException(
+            status_code=_map_rutina_rpc_error(exc),
+            detail=f"No fue posible reordenar la rutina personal: {exc}",
+        ) from exc
+
+    return {"mensaje": "Ejercicios reordenados correctamente.", "ejercicios": reordenados}
+
+
+# ==============================================================================
+# 2. RUTINAS ORGANIZACIONALES DEL GIMNASIO (`public.rutina_gimnasio`)
+# ==============================================================================
+
+@router.get("/gimnasio", status_code=status.HTTP_200_OK)
+@router.get("/ofrecidas", status_code=status.HTTP_200_OK)
+@router.get("/ofrecidas-gym", status_code=status.HTTP_200_OK)
+@router.get("/gym/ofrecidas", status_code=status.HTTP_200_OK)
+async def listar_rutinas_gimnasio(
+    id_gimnasio: Optional[int] = Query(default=None, gt=0),
+    solo_activas: bool = Query(default=False),
+    current_user: Dict[str, Any] = Depends(get_current_user),
+):
+    """
+    Lista las plantillas de `public.rutina_gimnasio` autorizadas:
+    - Para staff autorizado (dueño, admin org, admin sucursal, entrenador): catálogo completo de su gimnasio.
+    - Para socio: devuelve únicamente las rutinas de gimnasio que tiene asignadas (`rutinas_asignadas_socio_gimnasio`).
+    - Rechaza a recepcionistas (`403`) en consistencia con `rutina_gimnasio_select_authorized`.
+    """
+    if current_user.get("rol") == "socio":
+        asig_res = await listar_asignaciones_rutinas(
+            id_gimnasio=id_gimnasio, solo_activas=solo_activas, current_user=current_user
+        )
+        rutinas_vistas: Dict[int, Dict[str, Any]] = {}
+        for a in asig_res["asignaciones"]:
+            rg = a.get("rutina_gimnasio")
+            if isinstance(rg, dict) and rg.get("id_rutina_gimnasio") is not None:
+                rutinas_vistas[int(rg["id_rutina_gimnasio"])] = _sort_rutina_items(
+                    rg, "rutina_ejercicio_gimnasio"
+                )
+        return {
+            "total": len(rutinas_vistas),
+            "rutinas": list(rutinas_vistas.values()),
+        }
+
+    manager_ctx, gym_id = verify_can_manage_gym_training(current_user, id_gimnasio=id_gimnasio)
+    db: Client = manager_ctx["supabase"]
+    res = (
+        db.from_("rutina_gimnasio")
+        .select(RUTINA_GIMNASIO_SELECT)
+        .eq("id_gimnasio", gym_id)
+        .order("id_rutina_gimnasio", desc=True)
+        .execute()
+    )
+    rows = get_data(res) or []
+    rutinas = [
+        _sort_rutina_items(r, "rutina_ejercicio_gimnasio")
+        for r in (rows if isinstance(rows, list) else [])
+        if isinstance(r, dict)
+        and int(r.get("id_gimnasio") or 0) == gym_id
+        and (not solo_activas or r.get("estado") is True)
+    ]
+    return {"id_gimnasio": gym_id, "total": len(rutinas), "rutinas": rutinas}
+
+
+@router.get("/gimnasio/{id_rutina_gimnasio}", status_code=status.HTTP_200_OK)
+async def obtener_rutina_gimnasio(
+    id_rutina_gimnasio: int = Path(..., gt=0),
+    current_user: Dict[str, Any] = Depends(get_current_user),
+):
+    """Obtiene el detalle de una rutina de `public.rutina_gimnasio`."""
+    db: Client = current_user["supabase"]
+    rutina = _fetch_rutina_gimnasio_or_404(db, id_rutina_gimnasio)
+
+    if current_user.get("rol") == "socio":
+        asig_res = await listar_asignaciones_rutinas(current_user=current_user)
+        assigned_ids = {int(a["id_rutina_gimnasio"]) for a in asig_res["asignaciones"]}
+        if id_rutina_gimnasio not in assigned_ids:
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail="No tienes asignada esta rutina del gimnasio.",
+            )
+        return {"rutina": rutina}
+
+    verify_can_manage_gym_training(current_user, id_gimnasio=int(rutina["id_gimnasio"]))
+    return {"rutina": rutina}
+
+
+@router.post("/gimnasio", status_code=status.HTTP_201_CREATED)
+async def crear_rutina_gimnasio(
+    req: RutinaGimnasioCreate,
+    current_user: Dict[str, Any] = Depends(get_current_user),
+):
+    """Crea una plantilla reutilizable en `public.rutina_gimnasio` (dueño, admin org, admin sucursal o entrenador)."""
+    manager_ctx, gym_id = verify_can_manage_gym_training(current_user, id_gimnasio=req.id_gimnasio)
+    clean_nombre = req.nombre.strip()
+    if not clean_nombre:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="El nombre de la rutina es obligatorio.")
+
+    db: Client = manager_ctx["supabase"]
+    nueva = {
+        "id_gimnasio": gym_id,
+        "nombre": clean_nombre,
+        "descripcion": req.descripcion.strip() if req.descripcion and req.descripcion.strip() else None,
+        "nivel": req.nivel.strip() if req.nivel and req.nivel.strip() else None,
+        "estado": bool(req.estado),
+    }
+    res = db.from_("rutina_gimnasio").insert([nueva]).execute()
+    rows = get_data(res) or []
+    if not rows:
+        raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail="Error al crear la rutina de gimnasio.")
+    return {
+        "mensaje": "Rutina de gimnasio creada exitosamente.",
+        "rutina": _sort_rutina_items(rows[0], "rutina_ejercicio_gimnasio"),
+    }
+
+
+@router.put("/gimnasio/{id_rutina_gimnasio}", status_code=status.HTTP_200_OK)
+async def actualizar_rutina_gimnasio(
+    req: RutinaGimnasioUpdate,
+    id_rutina_gimnasio: int = Path(..., gt=0),
+    current_user: Dict[str, Any] = Depends(get_current_user),
+):
+    """Actualiza una rutina de `public.rutina_gimnasio` bloqueando transferencia de gimnasio."""
+    ensure_active_organizational_assignments(current_user)
+    db_initial: Client = current_user["supabase"]
+    actual = _fetch_rutina_gimnasio_or_404(db_initial, id_rutina_gimnasio)
+    gym_id = int(actual["id_gimnasio"])
+
+    if req.id_gimnasio is not None and str(req.id_gimnasio).strip() != str(gym_id):
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="No está permitido transferir una rutina_gimnasio a otro gimnasio.",
+        )
+
+    manager_ctx, _ = verify_can_manage_gym_training(current_user, id_gimnasio=gym_id)
+    update_data: Dict[str, Any] = {}
+    if req.nombre is not None:
+        clean_nombre = req.nombre.strip()
+        if not clean_nombre:
+            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="El nombre no puede estar vacío.")
+        update_data["nombre"] = clean_nombre
+    if req.descripcion is not None:
+        update_data["descripcion"] = req.descripcion.strip() or None
+    if req.nivel is not None:
+        update_data["nivel"] = req.nivel.strip() or None
+    if req.estado is not None:
+        update_data["estado"] = bool(req.estado)
+    if not update_data:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="No se enviaron campos a actualizar.")
+
+    db: Client = manager_ctx["supabase"]
+    res = (
+        db.from_("rutina_gimnasio")
+        .update(update_data)
+        .eq("id_rutina_gimnasio", id_rutina_gimnasio)
+        .eq("id_gimnasio", gym_id)
+        .execute()
+    )
+    rows = get_data(res) or []
+    if not rows:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Rutina de gimnasio no encontrada.")
+    return {"mensaje": "Rutina de gimnasio actualizada con éxito.", "rutina": rows[0]}
+
+
+@router.delete("/gimnasio/{id_rutina_gimnasio}", status_code=status.HTTP_200_OK)
+async def desactivar_o_eliminar_rutina_gimnasio(
+    id_rutina_gimnasio: int = Path(..., gt=0),
+    current_user: Dict[str, Any] = Depends(get_current_user),
+):
+    """
+    Si la rutina de gimnasio tiene asignaciones históricas (`ON DELETE RESTRICT`), la desactiva
+    lógicamente (`estado = false`) para preservar el historial; si nunca fue asignada, permite eliminarla.
+    """
+    ensure_active_organizational_assignments(current_user)
+    db_initial: Client = current_user["supabase"]
+    actual = _fetch_rutina_gimnasio_or_404(db_initial, id_rutina_gimnasio)
+    gym_id = int(actual["id_gimnasio"])
+    manager_ctx, _ = verify_can_manage_gym_training(current_user, id_gimnasio=gym_id)
+
+    db: Client = manager_ctx["supabase"]
+    res_asig = (
+        db.from_("rutinas_asignadas_socio_gimnasio")
+        .select("id_rutina_asignada")
+        .eq("id_rutina_gimnasio", id_rutina_gimnasio)
+        .execute()
+    )
+    asigs = get_data(res_asig) or []
+    if isinstance(asigs, list) and len(asigs) > 0:
+        res_upd = (
+            db.from_("rutina_gimnasio")
+            .update({"estado": False})
+            .eq("id_rutina_gimnasio", id_rutina_gimnasio)
+            .eq("id_gimnasio", gym_id)
+            .execute()
+        )
+        rows = get_data(res_upd) or []
+        return {
+            "mensaje": "Rutina de gimnasio desactivada lógicamente para conservar asignaciones históricas.",
+            "desactivada": True,
+            "rutina": rows[0] if rows else actual,
+        }
+
+    db.from_("rutina_gimnasio").delete().eq("id_rutina_gimnasio", id_rutina_gimnasio).eq("id_gimnasio", gym_id).execute()
+    return {"mensaje": f"Rutina de gimnasio {id_rutina_gimnasio} eliminada correctamente.", "eliminada": True}
+
+
+@router.post("/gimnasio/{id_rutina_gimnasio}/ejercicios", status_code=status.HTTP_201_CREATED)
+async def agregar_ejercicio_rutina_gimnasio(
+    req: RutinaEjercicioGimnasioAdd,
+    id_rutina_gimnasio: int = Path(..., gt=0),
+    current_user: Dict[str, Any] = Depends(get_current_user),
+):
+    """
+    Agrega un ejercicio de `public.ejercicio_gimnasio` a `public.rutina_ejercicio_gimnasio`.
+    Impide mezclar ejercicios personales (`ejercicio_socio`) o ejercicios de otro gimnasio.
+    """
+    if req.id_ejercicio_socio is not None:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="No se permite mezclar ejercicios personales (`ejercicio_socio`) en una rutina del gimnasio.",
+        )
+
+    ensure_active_organizational_assignments(current_user)
+    db_initial: Client = current_user["supabase"]
+    rutina = _fetch_rutina_gimnasio_or_404(db_initial, id_rutina_gimnasio)
+    gym_id = int(rutina["id_gimnasio"])
+    manager_ctx, _ = verify_can_manage_gym_training(current_user, id_gimnasio=gym_id)
+
+    db: Client = manager_ctx["supabase"]
+    res_ej = (
+        db.from_("ejercicio_gimnasio")
+        .select(EJERCICIO_GIMNASIO_COLUMNS)
+        .eq("id_ejercicio_gimnasio", req.id_ejercicio_gimnasio)
+        .maybe_single()
+        .execute()
+    )
+    ej = get_data(res_ej)
+    if not isinstance(ej, dict) or int(ej.get("id_gimnasio") or 0) != gym_id:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="El ejercicio especificado no existe o no pertenece al gimnasio de la rutina.",
+        )
+
+    for it in (rutina.get("rutina_ejercicio_gimnasio") or []):
+        if int(it.get("id_ejercicio_gimnasio") or 0) == req.id_ejercicio_gimnasio:
+            raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="Este ejercicio ya está en la rutina.")
+        if int(it.get("orden") or 0) == req.orden:
+            raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=f"El orden {req.orden} ya está ocupado.")
+
+    nuevo = {
+        "id_rutina_gimnasio": id_rutina_gimnasio,
+        "id_gimnasio": gym_id,
+        "id_ejercicio_gimnasio": req.id_ejercicio_gimnasio,
+        "series": int(req.series),
+        "repeticiones": int(req.repeticiones),
+        "peso": round(float(req.peso), 2) if req.peso is not None else 0.0,
+        "descanso": int(req.descanso) if req.descanso is not None else 60,
+        "orden": int(req.orden),
+    }
+    res = db.from_("rutina_ejercicio_gimnasio").insert([nuevo]).execute()
+    rows = get_data(res) or []
+    if not rows:
+        raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail="Error al asociar ejercicio a la rutina de gimnasio.")
+    return {"mensaje": "Ejercicio agregado a la rutina del gimnasio.", "item": rows[0]}
+
+
+@router.put("/gimnasio/{id_rutina_gimnasio}/ejercicios/{id_item}", status_code=status.HTTP_200_OK)
+async def actualizar_ejercicio_rutina_gimnasio(
+    req: RutinaEjercicioUpdate,
+    id_rutina_gimnasio: int = Path(..., gt=0),
+    id_item: int = Path(..., gt=0),
+    current_user: Dict[str, Any] = Depends(get_current_user),
+):
+    ensure_active_organizational_assignments(current_user)
+    db_initial: Client = current_user["supabase"]
+    rutina = _fetch_rutina_gimnasio_or_404(db_initial, id_rutina_gimnasio)
+    gym_id = int(rutina["id_gimnasio"])
+    manager_ctx, _ = verify_can_manage_gym_training(current_user, id_gimnasio=gym_id)
+
+    update_data: Dict[str, Any] = {}
+    if req.series is not None:
+        update_data["series"] = int(req.series)
+    if req.repeticiones is not None:
+        update_data["repeticiones"] = int(req.repeticiones)
+    if req.peso is not None:
+        update_data["peso"] = round(float(req.peso), 2)
+    if req.descanso is not None:
+        update_data["descanso"] = int(req.descanso)
+    if req.orden is not None:
+        update_data["orden"] = int(req.orden)
+    if not update_data:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="No se enviaron campos a actualizar.")
+
+    db: Client = manager_ctx["supabase"]
+    res = (
+        db.from_("rutina_ejercicio_gimnasio")
+        .update(update_data)
+        .eq("id_rutina_ejercicio_gimnasio", id_item)
+        .eq("id_rutina_gimnasio", id_rutina_gimnasio)
+        .eq("id_gimnasio", gym_id)
+        .execute()
+    )
+    rows = get_data(res) or []
+    if not rows:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Ítem de rutina de gimnasio no encontrado.")
+    return {"mensaje": "Ejercicio actualizado en la rutina del gimnasio.", "item": rows[0]}
+
+
+@router.delete("/gimnasio/{id_rutina_gimnasio}/ejercicios/{id_item}", status_code=status.HTTP_200_OK)
+async def eliminar_ejercicio_rutina_gimnasio(
+    id_rutina_gimnasio: int = Path(..., gt=0),
+    id_item: int = Path(..., gt=0),
+    current_user: Dict[str, Any] = Depends(get_current_user),
+):
+    ensure_active_organizational_assignments(current_user)
+    db_initial: Client = current_user["supabase"]
+    rutina = _fetch_rutina_gimnasio_or_404(db_initial, id_rutina_gimnasio)
+    gym_id = int(rutina["id_gimnasio"])
+    manager_ctx, _ = verify_can_manage_gym_training(current_user, id_gimnasio=gym_id)
+
+    db: Client = manager_ctx["supabase"]
+    res = (
+        db.from_("rutina_ejercicio_gimnasio")
+        .delete()
+        .eq("id_rutina_ejercicio_gimnasio", id_item)
+        .eq("id_rutina_gimnasio", id_rutina_gimnasio)
+        .eq("id_gimnasio", gym_id)
+        .execute()
+    )
+    rows = get_data(res) or []
+    if not rows:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Ítem de rutina de gimnasio no encontrado.")
+    return {"mensaje": "Ejercicio retirado de la rutina del gimnasio."}
+
+
+@router.put("/gimnasio/{id_rutina_gimnasio}/reordenar", status_code=status.HTTP_200_OK)
+async def reordenar_rutina_gimnasio(
+    req: RutinaReordenarRequest,
+    id_rutina_gimnasio: int = Path(..., gt=0),
+    current_user: Dict[str, Any] = Depends(get_current_user),
+):
+    """Reordena atómicamente los ejercicios de `rutina_gimnasio` vía `public.rpc_reordenar_rutina_gimnasio_ejercicios`."""
+    ensure_active_organizational_assignments(current_user)
+    db_initial: Client = current_user["supabase"]
+    rutina = _fetch_rutina_gimnasio_or_404(db_initial, id_rutina_gimnasio)
+    manager_ctx, _ = verify_can_manage_gym_training(current_user, id_gimnasio=int(rutina["id_gimnasio"]))
+    db: Client = manager_ctx["supabase"]
+
+    try:
+        res_rpc = db.rpc(
+            "rpc_reordenar_rutina_gimnasio_ejercicios",
+            {
+                "p_id_rutina_gimnasio": id_rutina_gimnasio,
+                "p_ids_ordenados": [int(x) for x in req.ids_ordenados],
+            },
+        ).execute()
+        reordenados = get_data(res_rpc)
+    except Exception as exc:
+        raise HTTPException(
+            status_code=_map_rutina_rpc_error(exc),
+            detail=f"No fue posible reordenar la rutina de gimnasio: {exc}",
+        ) from exc
+
+    return {"mensaje": "Ejercicios de rutina de gimnasio reordenados correctamente.", "ejercicios": reordenados}
+
+
+# ==============================================================================
+# 3. ASIGNACIONES DE RUTINAS (`public.rutinas_asignadas_socio_gimnasio` + RPCs)
+# ==============================================================================
+
+@router.get("/asignaciones", status_code=status.HTTP_200_OK)
+async def listar_asignaciones_rutinas(
+    id_gimnasio: Optional[int] = Query(default=None, gt=0),
+    id_socio: Optional[int] = Query(default=None, gt=0),
+    solo_activas: bool = Query(default=False),
+    current_user: Dict[str, Any] = Depends(get_current_user),
+):
+    """
+    Lista asignaciones de `public.rutinas_asignadas_socio_gimnasio`:
+    - Socio: únicamente sus propias asignaciones multi-gimnasio (rechaza `403` si intenta consultar otro `id_socio`).
+    - Staff (dueño, admin org, admin sucursal, entrenador): asignaciones de su gimnasio (rechaza `403` a recepcionistas).
+    """
+    if current_user.get("rol") == "socio":
+        socio_ctx = _resolve_socio_profile_context(current_user)
+        own_socio_id = int(socio_ctx["id_socio"])
+        if id_socio is not None and int(id_socio) != own_socio_id:
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail="No tienes autorización para consultar asignaciones de rutina de otro socio.",
+            )
+        db: Client = socio_ctx["supabase"]
+        asocs = _fetch_socio_gimnasios_for_socio(db, own_socio_id)
+        sg_ids_by_gym = {
+            int(a["id_gimnasio"]): int(a["id_socio_gimnasio"])
+            for a in asocs
+            if a.get("id_socio_gimnasio") is not None and a.get("id_gimnasio") is not None
+        }
+        if id_gimnasio is not None and id_gimnasio not in sg_ids_by_gym:
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail="No posees asociación con el gimnasio solicitado.",
+            )
+        target_sg_ids = [sg_ids_by_gym[id_gimnasio]] if id_gimnasio is not None else list(sg_ids_by_gym.values())
+        if not target_sg_ids:
+            return {"id_socio": own_socio_id, "total": 0, "asignaciones": []}
+
+        q = db.from_("rutinas_asignadas_socio_gimnasio").select(ASIGNACION_SELECT)
+        if len(target_sg_ids) == 1:
+            q = q.eq("id_socio_gimnasio", target_sg_ids[0])
+        else:
+            q = q.in_("id_socio_gimnasio", target_sg_ids)
+        res = q.order("id_rutina_asignada", desc=True).execute()
+        rows = get_data(res) or []
+        asignaciones = [
+            a for a in (rows if isinstance(rows, list) else [])
+            if isinstance(a, dict)
+            and int(a.get("id_socio_gimnasio") or 0) in set(target_sg_ids)
+            and (not solo_activas or a.get("estado") is True)
+        ]
+        return {"id_socio": own_socio_id, "total": len(asignaciones), "asignaciones": asignaciones}
+
+    manager_ctx, gym_id = verify_can_manage_gym_training(current_user, id_gimnasio=id_gimnasio)
+    db = manager_ctx["supabase"]
+    res = (
+        db.from_("rutinas_asignadas_socio_gimnasio")
+        .select(ASIGNACION_SELECT)
+        .eq("id_gimnasio", gym_id)
+        .order("id_rutina_asignada", desc=True)
+        .execute()
+    )
+    rows = get_data(res) or []
+    asignaciones: List[Dict[str, Any]] = []
+    for a in (rows if isinstance(rows, list) else []):
+        if not isinstance(a, dict) or int(a.get("id_gimnasio") or 0) != gym_id:
+            continue
+        if solo_activas and a.get("estado") is not True:
+            continue
+        if id_socio is not None:
+            sg = a.get("socio_gimnasio") if isinstance(a.get("socio_gimnasio"), dict) else {}
+            if int(sg.get("id_socio") or 0) != id_socio:
+                continue
+        asignaciones.append(a)
+    return {"id_gimnasio": gym_id, "total": len(asignaciones), "asignaciones": asignaciones}
+
+
+@router.post("/asignaciones", status_code=status.HTTP_201_CREATED)
+async def asignar_rutina_a_socio(
+    req: RutinaAsignarRequest,
+    current_user: Dict[str, Any] = Depends(get_current_user),
+):
+    """
+    Asigna una rutina existente de `public.rutina_gimnasio` a una asociación `public.socio_gimnasio`
+    sin duplicar la rutina, mediante `public.rpc_asignar_rutina_gimnasio_socio`.
+    """
+    ensure_active_organizational_assignments(current_user)
+    db_initial: Client = current_user["supabase"]
+    rutina = _fetch_rutina_gimnasio_or_404(db_initial, req.id_rutina_gimnasio)
+    gym_id = int(rutina["id_gimnasio"])
+    manager_ctx, _ = verify_can_manage_gym_training(current_user, id_gimnasio=gym_id)
+
+    db: Client = manager_ctx["supabase"]
+    try:
+        res_rpc = db.rpc(
+            "rpc_asignar_rutina_gimnasio_socio",
+            {
+                "p_id_rutina_gimnasio": req.id_rutina_gimnasio,
+                "p_id_socio_gimnasio": req.id_socio_gimnasio,
+                "p_fecha_finalizacion": req.fecha_finalizacion,
+                "p_observaciones": req.observaciones.strip() if req.observaciones and req.observaciones.strip() else None,
+                "p_id_empleado_responsable": req.id_empleado_responsable,
+            },
+        ).execute()
+        asignacion = get_data(res_rpc)
+    except Exception as exc:
+        raise HTTPException(
+            status_code=_map_rutina_rpc_error(exc),
+            detail=f"No fue posible asignar la rutina: {exc}",
+        ) from exc
+
+    return {
+        "mensaje": "Rutina asignada exitosamente al socio sin duplicar la plantilla.",
+        "asignacion": asignacion,
+    }
+
+
+@router.patch("/asignaciones/{id_rutina_asignada}/responsable", status_code=status.HTTP_200_OK)
+async def reasignar_responsable_rutina(
+    req: RutinaReasignarResponsableRequest,
+    id_rutina_asignada: int = Path(..., gt=0),
+    current_user: Dict[str, Any] = Depends(get_current_user),
+):
+    """
+    Reasigna el empleado responsable de una asignación activa mediante
+    `public.rpc_reasignar_responsable_rutina_asignada`.
+    Un empleado desactivado no puede recibir nuevas asignaciones ni reasignaciones.
+    """
+    ensure_active_organizational_assignments(current_user)
+    db_initial: Client = current_user["supabase"]
+    asig = _fetch_asignacion_or_404(db_initial, id_rutina_asignada)
+    manager_ctx, _ = verify_can_manage_gym_training(current_user, id_gimnasio=int(asig["id_gimnasio"]))
+
+    db: Client = manager_ctx["supabase"]
+    try:
+        res_rpc = db.rpc(
+            "rpc_reasignar_responsable_rutina_asignada",
+            {
+                "p_id_rutina_asignada": id_rutina_asignada,
+                "p_id_empleado_responsable": req.id_empleado_responsable,
+                "p_observaciones": req.observaciones.strip() if req.observaciones and req.observaciones.strip() else None,
+            },
+        ).execute()
+        updated = get_data(res_rpc)
+    except Exception as exc:
+        raise HTTPException(
+            status_code=_map_rutina_rpc_error(exc),
+            detail=f"No fue posible reasignar el responsable: {exc}",
+        ) from exc
+
+    return {
+        "mensaje": "Responsable de rutina reasignado exitosamente.",
+        "asignacion": updated,
+    }
+
+
+@router.patch("/asignaciones/{id_rutina_asignada}/finalizar", status_code=status.HTTP_200_OK)
+async def finalizar_asignacion_rutina(
+    id_rutina_asignada: int = Path(..., gt=0),
+    req: Optional[RutinaFinalizarAsignacionRequest] = Body(default=None),
+    current_user: Dict[str, Any] = Depends(get_current_user),
+):
+    """
+    Finaliza una asignación de rutina mediante `public.rpc_finalizar_rutina_asignada`.
+    Conserva intacto `id_empleado_responsable` como responsable histórico incluso si ese
+    empleado fue desactivado posteriormente.
+    """
+    ensure_active_organizational_assignments(current_user)
+    db_initial: Client = current_user["supabase"]
+    asig = _fetch_asignacion_or_404(db_initial, id_rutina_asignada)
+    manager_ctx, _ = verify_can_manage_gym_training(current_user, id_gimnasio=int(asig["id_gimnasio"]))
+
+    req_data = req or RutinaFinalizarAsignacionRequest()
+    db: Client = manager_ctx["supabase"]
+    try:
+        res_rpc = db.rpc(
+            "rpc_finalizar_rutina_asignada",
+            {
+                "p_id_rutina_asignada": id_rutina_asignada,
+                "p_fecha_finalizacion": req_data.fecha_finalizacion or date.today().isoformat(),
+                "p_observaciones": req_data.observaciones.strip() if req_data.observaciones and req_data.observaciones.strip() else None,
+            },
+        ).execute()
+        updated = get_data(res_rpc)
+    except Exception as exc:
+        raise HTTPException(
+            status_code=_map_rutina_rpc_error(exc),
+            detail=f"No fue posible finalizar la asignación de rutina: {exc}",
+        ) from exc
+
+    return {
+        "mensaje": "Asignación de rutina finalizada conservando el responsable histórico.",
+        "asignacion": updated,
+    }
+
+
+# ==============================================================================
+# 4. VISTA CONSOLIDADA (`GET /api/rutinas`)
+# ==============================================================================
+
+@router.get("", status_code=status.HTTP_200_OK)
+async def get_rutinas_resumen(
+    id_gimnasio: Optional[int] = Query(default=None, gt=0),
+    solo_activas: bool = Query(default=False),
+    current_user: Dict[str, Any] = Depends(get_current_user),
+):
+    """
+    Endpoint unificado de lectura:
+    - Socio: devuelve separadamente `rutinas_personales` (`rutina_socio`) y `rutinas_asignadas` (`rutinas_asignadas_socio_gimnasio`).
+    - Staff autorizado (dueño, admin org, admin sucursal, entrenador): devuelve `rutinas_gimnasio` y `asignaciones` del gimnasio.
+    """
+    if current_user.get("rol") == "socio":
+        pers = await listar_rutinas_personales(solo_activas=solo_activas, current_user=current_user)
+        asig = await listar_asignaciones_rutinas(
+            id_gimnasio=id_gimnasio, solo_activas=solo_activas, current_user=current_user
+        )
+        return {
+            "id_socio": pers["id_socio"],
+            "rutinas_personales": pers["rutinas"],
+            "rutinas_asignadas": asig["asignaciones"],
+        }
+
+    gym_res = await listar_rutinas_gimnasio(
+        id_gimnasio=id_gimnasio, solo_activas=solo_activas, current_user=current_user
+    )
+    asig_res = await listar_asignaciones_rutinas(
+        id_gimnasio=gym_res["id_gimnasio"], solo_activas=solo_activas, current_user=current_user
+    )
+    return {
+        "id_gimnasio": gym_res["id_gimnasio"],
+        "rutinas_gimnasio": gym_res["rutinas"],
+        "asignaciones": asig_res["asignaciones"],
+    }

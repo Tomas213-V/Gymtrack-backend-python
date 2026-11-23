@@ -1,416 +1,531 @@
-from datetime import datetime, date, timedelta
-from typing import Dict, Any, Optional
+from datetime import datetime, timezone
+from typing import Dict, Any, Optional, List
 from fastapi import APIRouter, HTTPException, status, Depends, Query, Path
-from app.config import supabase
+from supabase import Client
+
 from app.core.dependencies import get_current_user
 from app.services.utils import get_data
 from app.models.pago import PagoCreate, PagoUpdateEstado
+from app.routers.socios import (
+    _verify_staff_can_manage_socios,
+    _resolve_socio_profile_context,
+    _fetch_socio_gimnasios_for_gym,
+    _fetch_socio_gimnasios_for_socio,
+)
+from app.routers.membresias import (
+    MEMBRESIA_SOCIO_SELECT,
+    _fetch_membresia_or_404,
+    _extract_socio_id_from_membresia,
+    _map_rpc_error_status,
+)
+from app.routers.planes_membresia import PLAN_COLUMNS
 
 router = APIRouter(prefix="/api/pagos", tags=["Pagos"])
+
+PAGO_SELECT = (
+    "id_pago, fecha_pago, monto, metodo_pago, estado, comprobante, id_membresia_socio, "
+    "membresia_socio(id_membresia_socio, id_socio_gimnasio, id_membresia_gimnasio, id_gimnasio, "
+    "precio, fecha_inicio, fecha_vencimiento, estado, "
+    "socio_gimnasio(id_socio_gimnasio, id_socio, id_gimnasio, estado, "
+    "socio(id_socio, nombre, apellido, dni, email)), "
+    "membresia_gimnasio(id_membresia_gimnasio, nombre, precio, duracion_dias))"
+)
+
+ESTADOS_PAGO_VALIDOS = {"pendiente", "aprobado", "rechazado", "anulado"}
+
+
+def _verify_staff_can_access_pagos(
+    current_user: Dict[str, Any],
+    id_gimnasio: Optional[int] = None,
+) -> tuple[Dict[str, Any], int]:
+    """
+    Valida permisos financieros sobre `public.pago` en correspondencia con la política RLS
+    `pago_select_authorized`, `rpc_registrar_pago` y `rpc_actualizar_estado_pago`:
+      - Dueño del gimnasio.
+      - Administrador organizacional activo del gimnasio.
+      - Empleado operativo con rol activo `'administrador'` o `'recepcionista'` en el gimnasio.
+    Rechaza estrictamente a `entrenador`, `socio` y personal de otros gimnasios con `403 Forbidden`.
+    """
+    return _verify_staff_can_manage_socios(current_user, id_gimnasio=id_gimnasio)
+
+
+def _fetch_pago_or_404(db: Client, id_pago: int) -> Dict[str, Any]:
+    res = (
+        db.from_("pago")
+        .select(PAGO_SELECT)
+        .eq("id_pago", id_pago)
+        .maybe_single()
+        .execute()
+    )
+    pago = get_data(res)
+    if not isinstance(pago, dict):
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Pago no encontrado.")
+    return pago
+
+
+def _extract_gym_id_from_pago(pago: Dict[str, Any]) -> Optional[int]:
+    ms = pago.get("membresia_socio")
+    if isinstance(ms, dict) and ms.get("id_gimnasio") is not None:
+        return int(ms["id_gimnasio"])
+    return None
+
+
+def _extract_socio_id_from_pago(pago: Dict[str, Any]) -> Optional[int]:
+    ms = pago.get("membresia_socio")
+    if isinstance(ms, dict):
+        return _extract_socio_id_from_membresia(ms)
+    return None
+
+
+def _filter_pagos_by_gym_and_params(
+    rows: List[Dict[str, Any]],
+    gym_id: int,
+    estado: Optional[str] = None,
+    desde: Optional[str] = None,
+    hasta: Optional[str] = None,
+    id_membresia_socio: Optional[int] = None,
+) -> List[Dict[str, Any]]:
+    estado_norm = estado.strip().lower() if estado and estado.strip().lower() != "todos" else None
+    if estado_norm and estado_norm not in ESTADOS_PAGO_VALIDOS:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Estado de pago inválido. Permitidos: pendiente, aprobado, rechazado, anulado.",
+        )
+
+    filtrados: List[Dict[str, Any]] = []
+    for p in rows:
+        if not isinstance(p, dict):
+            continue
+        if _extract_gym_id_from_pago(p) != gym_id:
+            continue
+        if id_membresia_socio is not None and int(p.get("id_membresia_socio") or 0) != id_membresia_socio:
+            continue
+        if estado_norm and str(p.get("estado") or "").strip().lower() != estado_norm:
+            continue
+        f_pago = str(p.get("fecha_pago") or "")
+        if desde and f_pago and f_pago < desde:
+            continue
+        if hasta and f_pago and f_pago > hasta:
+            continue
+        filtrados.append(p)
+    return filtrados
+
+
+@router.get("/mis-pagos", status_code=status.HTTP_200_OK)
+async def get_mis_pagos(
+    id_gimnasio: Optional[int] = Query(default=None, gt=0),
+    current_user: Dict[str, Any] = Depends(get_current_user),
+):
+    """Permite al socio autenticado consultar exclusivamente su propio historial de pagos."""
+    socio_ctx = _resolve_socio_profile_context(current_user)
+    own_socio_id = int(socio_ctx["id_socio"])
+    db: Client = socio_ctx["supabase"]
+
+    asociaciones = _fetch_socio_gimnasios_for_socio(db, own_socio_id)
+    allowed_gym_ids = {int(a["id_gimnasio"]) for a in asociaciones if a.get("id_gimnasio") is not None}
+    if id_gimnasio is not None and id_gimnasio not in allowed_gym_ids:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="No posees asociación con el gimnasio solicitado.",
+        )
+
+    res = db.from_("pago").select(PAGO_SELECT).order("fecha_pago", desc=True).execute()
+    rows = get_data(res)
+    propios = [
+        p for p in (rows if isinstance(rows, list) else [])
+        if isinstance(p, dict)
+        and _extract_socio_id_from_pago(p) == own_socio_id
+        and (id_gimnasio is None or _extract_gym_id_from_pago(p) == id_gimnasio)
+    ]
+    return {
+        "id_socio": own_socio_id,
+        "total": len(propios),
+        "datos": propios,
+    }
 
 
 @router.get("/resumen", status_code=status.HTTP_200_OK)
 async def get_resumen_pagos(
-    desde: Optional[str] = Query(None),
-    hasta: Optional[str] = Query(None),
-    id_gimnasio: Optional[int] = Query(None),
-    current_user: Optional[Dict[str, Any]] = Depends(get_current_user)
+    desde: Optional[str] = Query(default=None),
+    hasta: Optional[str] = Query(default=None),
+    id_gimnasio: Optional[int] = Query(default=None, gt=0),
+    current_user: Dict[str, Any] = Depends(get_current_user),
 ):
-    """Obtener resumen y métricas de pagos (total recaudado, realizados, pendientes, vencidos)."""
-    gym_id = id_gimnasio or (current_user.get("id_gimnasio") if current_user else None)
+    """
+    Obtiene métricas financieras consolidadas de `public.pago` para el gimnasio autorizado
+    usando los estados definitivos (`aprobado`, `pendiente`, `rechazado`, `anulado`).
+    """
+    staff_ctx, gym_id = _verify_staff_can_access_pagos(current_user, id_gimnasio=id_gimnasio)
+    db: Client = staff_ctx["supabase"]
 
-    if gym_id:
-        query = (
-            supabase.from_("pago")
-            .select("monto, estado, membresia!inner(socio!inner(id_gimnasio))")
-            .eq("membresia.socio.id_gimnasio", gym_id)
-        )
-    else:
-        query = supabase.from_("pago").select("monto, estado, membresia(socio(id_gimnasio))")
-
-    if desde:
-        query = query.gte("fecha_pago", desde)
-    if hasta:
-        query = query.lte("fecha_pago", hasta)
-
-    res = query.execute()
-    target_data = res.data or []
+    res = db.from_("pago").select(PAGO_SELECT).order("fecha_pago", desc=True).execute()
+    rows = get_data(res)
+    pagos = _filter_pagos_by_gym_and_params(
+        rows if isinstance(rows, list) else [],
+        gym_id=gym_id,
+        desde=desde,
+        hasta=hasta,
+    )
 
     resumen = {
-        "total_recaudado": 0,
-        "pagos_realizados": 0,
+        "id_gimnasio": gym_id,
+        "total_recaudado": 0.0,
+        "pagos_aprobados": 0,
         "pagos_pendientes": 0,
-        "pagos_vencidos": 0,
+        "pagos_rechazados": 0,
+        "pagos_anulados": 0,
     }
-
-    for pago in target_data:
-        estado_norm = str(pago.get("estado") or "").strip().lower()
-        if estado_norm == "pagado":
-            resumen["total_recaudado"] += float(pago.get("monto") or 0)
-            resumen["pagos_realizados"] += 1
-        elif estado_norm == "pendiente":
+    for p in pagos:
+        est = str(p.get("estado") or "").strip().lower()
+        if est == "aprobado":
+            resumen["total_recaudado"] += float(p.get("monto") or 0)
+            resumen["pagos_aprobados"] += 1
+        elif est == "pendiente":
             resumen["pagos_pendientes"] += 1
-        elif estado_norm == "vencido":
-            resumen["pagos_vencidos"] += 1
+        elif est == "rechazado":
+            resumen["pagos_rechazados"] += 1
+        elif est == "anulado":
+            resumen["pagos_anulados"] += 1
 
+    resumen["total_recaudado"] = round(resumen["total_recaudado"], 2)
     return resumen
 
 
 @router.get("/membresias", status_code=status.HTTP_200_OK)
 async def get_pagos_membresias(
-    id_gimnasio: Optional[int] = Query(None),
-    current_user: Optional[Dict[str, Any]] = Depends(get_current_user)
+    id_gimnasio: Optional[int] = Query(default=None, gt=0),
+    current_user: Dict[str, Any] = Depends(get_current_user),
 ):
-    """Listado de socios y membresías del gimnasio para registrar pagos."""
-    gym_id = id_gimnasio or (current_user.get("id_gimnasio") if current_user else None)
+    """Lista socios asociados (`socio_gimnasio`) y sus contrataciones (`membresia_socio`) para cobro."""
+    staff_ctx, gym_id = _verify_staff_can_access_pagos(current_user, id_gimnasio=id_gimnasio)
+    db: Client = staff_ctx["supabase"]
 
-    query = (
-        supabase.from_("socio")
-        .select("""
-            id_socio,
-            dni,
-            telefono,
-            nombre,
-            apellido,
-            email,
-            estado,
-            id_gimnasio,
-            membresia (
-                id_membresia,
-                precio,
-                fecha_inicio,
-                fecha_vencimiento,
-                estado,
-                id_plan_membresia,
-                plan_membresia (
-                    id_plan_membresia,
-                    nombre,
-                    precio,
-                    duracion_dias
-                )
-            )
-        """)
-        .order("id_socio", desc=True)
+    asociaciones = _fetch_socio_gimnasios_for_gym(db, gym_id)
+    res_m = (
+        db.from_("membresia_socio")
+        .select(MEMBRESIA_SOCIO_SELECT)
+        .eq("id_gimnasio", gym_id)
+        .order("fecha_vencimiento", desc=True)
+        .execute()
     )
-
-    if gym_id:
-        query = query.eq("id_gimnasio", gym_id)
-
-    res = query.execute()
-    socios = res.data or []
+    membs = get_data(res_m)
+    membs_by_sg: Dict[int, List[Dict[str, Any]]] = {}
+    for m in (membs if isinstance(membs, list) else []):
+        if isinstance(m, dict) and int(m.get("id_gimnasio") or 0) == gym_id:
+            sg_id = int(m.get("id_socio_gimnasio") or 0)
+            membs_by_sg.setdefault(sg_id, []).append(m)
 
     resultado = []
-    for s in socios:
-        m_list = s.get("membresia")
-        memb_list = m_list if isinstance(m_list, list) else ([m_list] if m_list else [])
-        m_activa = next(
-            (m for m in memb_list if (m.get("estado") or "").lower() == "activo"),
-            memb_list[0] if memb_list else None
+    for sg in asociaciones:
+        sg_id = int(sg.get("id_socio_gimnasio") or 0)
+        socio_obj = sg.get("socio") if isinstance(sg.get("socio"), dict) else {}
+        m_list = membs_by_sg.get(sg_id, [])
+        m_activa = next((m for m in m_list if m.get("estado") == "activa"), m_list[0] if m_list else None)
+        resultado.append(
+            {
+                "id_socio_gimnasio": sg_id,
+                "id_gimnasio": gym_id,
+                "estado_asociacion": sg.get("estado"),
+                "socio": socio_obj,
+                "membresias": m_list,
+                "membresia_activa": m_activa,
+            }
         )
-        resultado.append({
-            **s,
-            "membresia_activa": m_activa,
-        })
-
     return resultado
 
 
 @router.get("/planes", status_code=status.HTTP_200_OK)
 async def get_pagos_planes(
-    id_gimnasio: Optional[int] = Query(None),
-    current_user: Optional[Dict[str, Any]] = Depends(get_current_user)
+    id_gimnasio: Optional[int] = Query(default=None, gt=0),
+    current_user: Dict[str, Any] = Depends(get_current_user),
 ):
-    """Listar planes de membresía disponibles para pagos (siembra planes iniciales si está vacío)."""
-    gym_id = id_gimnasio or (current_user.get("id_gimnasio") if current_user else None)
+    """Lista los planes activos (`public.membresia_gimnasio`) del gimnasio autorizado para cobros (sin autosembrado legacy)."""
+    staff_ctx, gym_id = _verify_staff_can_access_pagos(current_user, id_gimnasio=id_gimnasio)
+    db: Client = staff_ctx["supabase"]
 
-    query = supabase.from_("plan_membresia").select("*").order("id_plan_membresia", desc=False)
-    if gym_id:
-        query = query.eq("id_gimnasio", gym_id)
-
-    res = query.execute()
-    data = res.data or []
-
-    # Sembrado inicial si está vacío
-    if not data and gym_id:
-        planes_iniciales = [
-            {"id_gimnasio": int(gym_id), "nombre": "Plan Básico", "precio": 15000, "duracion_dias": 30, "estado": "Activo"},
-            {"id_gimnasio": int(gym_id), "nombre": "Plan Premium", "precio": 22000, "duracion_dias": 30, "estado": "Activo"},
-            {"id_gimnasio": int(gym_id), "nombre": "Pase Libre", "precio": 28000, "duracion_dias": 30, "estado": "Activo"},
-        ]
-        res_ins = supabase.from_("plan_membresia").insert(planes_iniciales).execute()
-        if res_ins.data:
-            data = res_ins.data
-
-    return data
+    res = (
+        db.from_("membresia_gimnasio")
+        .select(PLAN_COLUMNS)
+        .eq("id_gimnasio", gym_id)
+        .order("id_membresia_gimnasio", desc=False)
+        .execute()
+    )
+    rows = get_data(res)
+    return [
+        p for p in (rows if isinstance(rows, list) else [])
+        if isinstance(p, dict) and int(p.get("id_gimnasio") or 0) == gym_id and p.get("estado") is not False
+    ]
 
 
 @router.get("", status_code=status.HTTP_200_OK)
 async def get_pagos(
-    page: int = Query(1, ge=1),
-    limit: int = Query(10, ge=1),
-    estado: Optional[str] = Query(None),
-    desde: Optional[str] = Query(None),
-    hasta: Optional[str] = Query(None),
-    id_gimnasio: Optional[int] = Query(None),
-    current_user: Optional[Dict[str, Any]] = Depends(get_current_user)
+    page: int = Query(default=1, ge=1),
+    limit: int = Query(default=10, ge=1, le=200),
+    estado: Optional[str] = Query(default=None),
+    desde: Optional[str] = Query(default=None),
+    hasta: Optional[str] = Query(default=None),
+    id_membresia_socio: Optional[int] = Query(default=None, gt=0),
+    id_gimnasio: Optional[int] = Query(default=None, gt=0),
+    current_user: Dict[str, Any] = Depends(get_current_user),
 ):
-    """Listado paginado de pagos con filtros."""
-    gym_id = id_gimnasio or (current_user.get("id_gimnasio") if current_user else None)
+    """
+    Listado paginado de pagos (`public.pago`) del gimnasio autorizado.
+    - Si es socio: devuelve únicamente sus propios pagos.
+    - Si es staff financiero autorizado: devuelve los pagos de su gimnasio.
+    - Rechaza entrenadores y gimnasios ajenos con `403 Forbidden`.
+    """
+    if current_user.get("rol") == "socio":
+        return await get_mis_pagos(id_gimnasio=id_gimnasio, current_user=current_user)
+
+    staff_ctx, gym_id = _verify_staff_can_access_pagos(current_user, id_gimnasio=id_gimnasio)
+    db: Client = staff_ctx["supabase"]
+
+    res = db.from_("pago").select(PAGO_SELECT).order("id_pago", desc=True).execute()
+    rows = get_data(res)
+    filtrados = _filter_pagos_by_gym_and_params(
+        rows if isinstance(rows, list) else [],
+        gym_id=gym_id,
+        estado=estado,
+        desde=desde,
+        hasta=hasta,
+        id_membresia_socio=id_membresia_socio,
+    )
+    filtrados.sort(key=lambda r: int(r.get("id_pago") or 0), reverse=True)
+    total = len(filtrados)
     offset = (page - 1) * limit
-
-    if gym_id:
-        query = (
-            supabase.from_("pago")
-            .select("*, membresia!inner(*, plan_membresia(*), socio!inner(*))", count="exact")
-            .order("id_pago", desc=True)
-            .range(offset, offset + limit - 1)
-            .eq("membresia.socio.id_gimnasio", gym_id)
-        )
-    else:
-        query = (
-            supabase.from_("pago")
-            .select("*, membresia(*, plan_membresia(*), socio(*))", count="exact")
-            .order("id_pago", desc=True)
-            .range(offset, offset + limit - 1)
-        )
-
-    if estado and estado.lower() != "todos":
-        query = query.eq("estado", estado.lower())
-    if desde:
-        query = query.gte("fecha_pago", desde)
-    if hasta:
-        query = query.lte("fecha_pago", hasta)
-
-    res = query.execute()
+    pagina_rows = filtrados[offset : offset + limit]
 
     return {
-        "total": res.count or 0,
+        "id_gimnasio": gym_id,
+        "total": total,
         "pagina": page,
         "limite": limit,
-        "datos": res.data or [],
+        "datos": pagina_rows,
     }
 
 
-@router.get("/{id}", status_code=status.HTTP_200_OK)
-async def get_pago_by_id(id: int = Path(...)):
-    """Obtener pago por ID con detalles de socio y membresía."""
-    res = (
-        supabase.from_("pago")
-        .select("*, membresia(*, plan_membresia(*), socio(*))")
-        .eq("id_pago", id)
-        .maybe_single()
-        .execute()
-    )
+@router.get("/{id_pago}", status_code=status.HTTP_200_OK)
+async def get_pago_by_id(
+    id_pago: int = Path(..., gt=0),
+    current_user: Dict[str, Any] = Depends(get_current_user),
+):
+    """Obtiene el detalle de un pago validando pertenencia al socio o al gimnasio autorizado."""
+    db: Client = current_user["supabase"]
+    pago = _fetch_pago_or_404(db, id_pago)
 
-    pago = get_data(res)
-    if not pago:
-        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Pago no encontrado.")
+    if current_user.get("rol") == "socio":
+        own_id = current_user.get("id_socio")
+        if not own_id or _extract_socio_id_from_pago(pago) != int(own_id):
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail="No tienes autorización para consultar un pago ajeno.",
+            )
+        return pago
 
+    gym_id = _extract_gym_id_from_pago(pago)
+    if gym_id is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Pago sin contratación asociada.")
+    _verify_staff_can_access_pagos(current_user, id_gimnasio=gym_id)
     return pago
 
 
 @router.post("", status_code=status.HTTP_201_CREATED)
 async def registrar_pago(
     req: PagoCreate,
-    current_user: Optional[Dict[str, Any]] = Depends(get_current_user)
+    current_user: Dict[str, Any] = Depends(get_current_user),
 ):
-    """Registrar un nuevo pago en el sistema."""
-    gym_id = req.id_gimnasio or (current_user.get("id_gimnasio") if current_user else None)
-    socio_id = req.id_socio or req.socio_id
+    """
+    Registra un pago sobre una contratación existente `public.membresia_socio` utilizando
+    exclusivamente la RPC `public.rpc_registrar_pago`.
+    - Valida pertenencia de la contratación al gimnasio autorizado (evita pagos cruzados).
+    - Valida saldo pendiente real en backend y en RPC (bloquea sobrepagos e importes inválidos).
+    - Prohíbe operaciones financieras a socios y entrenadores (`403 Forbidden`).
+    """
+    if current_user.get("rol") == "socio":
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Los socios no tienen autorización para registrar pagos administrativos directamente.",
+        )
 
-    # 1. Crear socio al paso si no existe
-    if not socio_id and (req.nombre or req.dni):
-        if not gym_id:
-            raise HTTPException(
-                status_code=status.HTTP_400_BAD_REQUEST,
-                detail="Se requiere id_gimnasio para registrar un nuevo socio."
-            )
-        clean_dni = str(req.dni).strip() if req.dni else f"DNI-{int(datetime.now().timestamp())}"
-        nuevo_socio = {
-            "id_gimnasio": gym_id,
-            "nombre": (req.nombre or "Socio").strip(),
-            "apellido": (req.apellido or "").strip(),
-            "dni": clean_dni,
-            "telefono": req.telefono.strip() if req.telefono else None,
-            "email": req.email.strip().lower() if req.email else None,
-            "fecha_alta": date.today().isoformat(),
-            "estado": "activo",
-        }
-        res_ns = supabase.from_("socio").insert([nuevo_socio]).execute()
-        if res_ns.data:
-            socio_id = res_ns.data[0]["id_socio"]
+    db_initial: Client = current_user["supabase"]
+    contrato = _fetch_membresia_or_404(db_initial, req.id_membresia_socio)
+    contrato_gym_id = int(contrato["id_gimnasio"])
 
-    if not req.id_membresia and not socio_id:
+    if req.id_gimnasio is not None and int(req.id_gimnasio) != contrato_gym_id:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="No se permiten pagos cruzados entre gimnasios: la contratación pertenece a otro gimnasio.",
+        )
+
+    staff_ctx, _ = _verify_staff_can_access_pagos(current_user, id_gimnasio=contrato_gym_id)
+    staff_db: Client = staff_ctx["supabase"]
+
+    if str(contrato.get("estado") or "").lower() == "cancelada":
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
-            detail="Debes seleccionar o registrar un socio para procesar el pago."
+            detail="No se pueden registrar pagos sobre una contratación cancelada.",
         )
 
-    # 2. Gestionar membresía asociada
-    id_membresia = req.id_membresia
-    fecha_pago_str = req.fecha_pago or date.today().isoformat()
-    estado_pago = (req.estado or "pagado").strip().lower()
-
-    if not id_membresia and socio_id:
-        res_mex = (
-            supabase.from_("membresia")
-            .select("id_membresia, id_plan_membresia")
-            .eq("id_socio", socio_id)
-            .eq("estado", "activo")
-            .maybe_single()
-            .execute()
-        )
-        mex_data = get_data(res_mex)
-        if mex_data:
-            id_membresia = mex_data["id_membresia"]
-        else:
-            plan_id = req.id_plan_membresia
-            duracion_dias = 30
-            if plan_id:
-                res_p = (
-                    supabase.from_("plan_membresia")
-                    .select("duracion_dias")
-                    .eq("id_plan_membresia", plan_id)
-                    .maybe_single()
-                    .execute()
-                )
-                p_data = get_data(res_p)
-                if p_data and p_data.get("duracion_dias"):
-                    duracion_dias = p_data["duracion_dias"]
-            elif req.plan:
-                pq = supabase.from_("plan_membresia").select("id_plan_membresia, duracion_dias").ilike("nombre", f"%{req.plan}%")
-                if gym_id:
-                    pq = pq.eq("id_gimnasio", gym_id)
-                res_pf = pq.limit(1).maybe_single().execute()
-                pf_data = get_data(res_pf)
-                if pf_data:
-                    plan_id = pf_data["id_plan_membresia"]
-                    duracion_dias = pf_data.get("duracion_dias") or 30
-
-            if not plan_id and gym_id:
-                res_pdef = supabase.from_("plan_membresia").select("id_plan_membresia, duracion_dias").eq("id_gimnasio", gym_id).limit(1).maybe_single().execute()
-                pdef_data = get_data(res_pdef)
-                if pdef_data:
-                    plan_id = pdef_data["id_plan_membresia"]
-                    duracion_dias = pdef_data.get("duracion_dias") or 30
-                else:
-                    res_pn = supabase.from_("plan_membresia").insert([{
-                        "id_gimnasio": int(gym_id),
-                        "nombre": req.plan or "Plan Premium",
-                        "precio": float(req.monto) or 18000.0,
-                        "duracion_dias": 30,
-                        "estado": "Activo"
-                    }]).execute()
-                    if res_pn.data:
-                        plan_id = res_pn.data[0]["id_plan_membresia"]
-                        duracion_dias = 30
-
-            f_base = date.fromisoformat(fecha_pago_str.split("T")[0])
-            nueva_memb = {
-                "id_socio": socio_id,
-                "precio": float(req.monto),
-                "fecha_inicio": f_base.isoformat(),
-                "fecha_vencimiento": (f_base + timedelta(days=duracion_dias)).isoformat(),
-                "estado": "activo" if estado_pago == "pagado" else ("vencido" if estado_pago == "vencido" else "activo"),
-            }
-            if plan_id:
-                nueva_memb["id_plan_membresia"] = plan_id
-
-            res_ins_m = supabase.from_("membresia").insert([nueva_memb]).execute()
-            if res_ins_m.data:
-                id_membresia = res_ins_m.data[0]["id_membresia"]
-
-    if not id_membresia:
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail="No se pudo vincular una membresía para este socio."
-        )
-
-    insert_pago = {
-        "id_membresia": id_membresia,
-        "monto": float(req.monto),
-        "fecha_pago": fecha_pago_str,
-        "metodo_pago": (req.metodo_pago or "efectivo").lower(),
-        "estado": estado_pago,
-        "comprobante": req.comprobante or None,
-    }
-
-    res_pago = supabase.from_("pago").insert([insert_pago]).execute()
-    if not res_pago.data:
-        raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail="Error al registrar el pago.")
-
-    id_nuevo_pago = res_pago.data[0]["id_pago"]
-    res_full = (
-        supabase.from_("pago")
-        .select("*, membresia(*, plan_membresia(*), socio(*))")
-        .eq("id_pago", id_nuevo_pago)
-        .single()
+    precio_contrato = round(float(contrato.get("precio") or 0), 2)
+    res_pagos_exist = (
+        staff_db.from_("pago")
+        .select("id_pago, monto, estado, comprobante")
+        .eq("id_membresia_socio", req.id_membresia_socio)
         .execute()
     )
+    pagos_existentes = get_data(res_pagos_exist) or []
+    total_aprobado = round(
+        sum(
+            float(p.get("monto") or 0)
+            for p in (pagos_existentes if isinstance(pagos_existentes, list) else [])
+            if isinstance(p, dict) and str(p.get("estado") or "").lower() == "aprobado"
+        ),
+        2,
+    )
+    saldo_pendiente = round(max(0.0, precio_contrato - total_aprobado), 2)
+
+    # Si no se envía monto, el backend determina el saldo pendiente real de la contratación
+    monto_efectivo = saldo_pendiente if req.monto is None else round(float(req.monto), 2)
+
+    if monto_efectivo < 0:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="El monto del pago no puede ser negativo.",
+        )
+
+    if precio_contrato > 0 and monto_efectivo == 0 and req.estado == "aprobado":
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="No se puede aprobar un pago de monto 0 cuando el precio contratado es mayor a 0.",
+        )
+
+    if req.estado in ("pendiente", "aprobado") and round(total_aprobado + monto_efectivo, 2) > precio_contrato:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=(
+                f"El monto ({monto_efectivo}) excede el saldo pendiente de la contratación "
+                f"(precio: {precio_contrato}, ya aprobado: {total_aprobado}). No se permiten sobrepagos."
+            ),
+        )
+
+    rpc_params = {
+        "p_id_membresia_socio": req.id_membresia_socio,
+        "p_monto": monto_efectivo,
+        "p_metodo_pago": req.metodo_pago,
+        "p_estado": req.estado,
+        "p_comprobante": req.comprobante.strip() if req.comprobante and req.comprobante.strip() else None,
+        "p_fecha_pago": req.fecha_pago or datetime.now(timezone.utc).isoformat(),
+    }
+
+    try:
+        res_rpc = staff_db.rpc("rpc_registrar_pago", rpc_params).execute()
+        pago_creado = get_data(res_rpc)
+    except Exception as exc:
+        raise HTTPException(
+            status_code=_map_rpc_error_status(exc),
+            detail=f"No fue posible registrar el pago: {exc}",
+        ) from exc
 
     return {
         "mensaje": "Pago registrado con éxito.",
-        "pago": res_full.data or res_pago.data[0],
+        "pago": pago_creado,
     }
 
 
-@router.patch("/{id}/estado", status_code=status.HTTP_200_OK)
+@router.patch("/{id_pago}/estado", status_code=status.HTTP_200_OK)
 async def actualizar_estado_pago(
-    id: int = Path(...),
-    req: PagoUpdateEstado = ...
+    req: PagoUpdateEstado,
+    id_pago: int = Path(..., gt=0),
+    current_user: Dict[str, Any] = Depends(get_current_user),
 ):
-    """Actualizar estado del pago (pagado, pendiente, vencido) y sincronizar membresía y socio."""
-    estados_permitidos = ["pagado", "pendiente", "vencido"]
-    nuevo_estado = req.estado.strip().lower()
-
-    if nuevo_estado not in estados_permitidos:
+    """
+    Transiciona el estado de un pago existente mediante `public.rpc_actualizar_estado_pago`.
+    - Respeta la máquina de estados contable: un pago aprobado solo puede pasar a 'anulado';
+      un pago anulado es inmutable; un pago rechazado no puede reactivarse como aprobado.
+    - Bloquea modificaciones sobre monto, método, comprobante, fecha o contratación (`403`).
+    """
+    if (
+        req.monto is not None
+        or req.metodo_pago is not None
+        or req.comprobante is not None
+        or req.fecha_pago is not None
+        or req.id_membresia_socio is not None
+    ):
         raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail="Estado no válido o no proporcionado."
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="No está permitido modificar importes, fechas, referencias ni método de un pago existente.",
         )
 
-    res_upd = (
-        supabase.from_("pago")
-        .update({"estado": nuevo_estado})
-        .eq("id_pago", id)
-        .execute()
-    )
-    if not res_upd.data:
-        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Pago no encontrado para actualizar.")
+    if current_user.get("rol") == "socio":
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Los socios no tienen autorización para modificar el estado de pagos.",
+        )
 
-    # Sincronizar membresía y socio asociados
-    res_full = (
-        supabase.from_("pago")
-        .select("*, membresia(*, plan_membresia(*), socio(*))")
-        .eq("id_pago", id)
-        .single()
-        .execute()
-    )
-    pago_actualizado = res_full.data
+    db_initial: Client = current_user["supabase"]
+    pago_actual = _fetch_pago_or_404(db_initial, id_pago)
+    gym_id = _extract_gym_id_from_pago(pago_actual)
+    if gym_id is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Pago sin contratación asociada.")
 
-    if pago_actualizado and pago_actualizado.get("id_membresia"):
-        estado_memb = "activo" if nuevo_estado == "pagado" else ("vencido" if nuevo_estado == "vencido" else "pendiente")
-        supabase.from_("membresia").update({"estado": estado_memb}).eq("id_membresia", pago_actualizado["id_membresia"]).execute()
+    staff_ctx, _ = _verify_staff_can_access_pagos(current_user, id_gimnasio=gym_id)
+    estado_actual = str(pago_actual.get("estado") or "").strip().lower()
+    nuevo_estado = req.estado
 
-        socio_data = pago_actualizado.get("membresia", {}).get("socio")
-        if socio_data and socio_data.get("id_socio"):
-            estado_socio = "activo" if nuevo_estado == "pagado" else ("inactivo" if nuevo_estado == "vencido" else "activo")
-            supabase.from_("socio").update({"estado": estado_socio}).eq("id_socio", socio_data["id_socio"]).execute()
+    if estado_actual == "anulado" and nuevo_estado != "anulado":
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="Un pago anulado es inmutable y no puede reactivarse ni transicionar.",
+        )
+    if estado_actual == "aprobado" and nuevo_estado not in ("aprobado", "anulado"):
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="Un pago confirmado/aprobado no puede modificarse arbitrariamente; únicamente admite anulación lógica ('anulado').",
+        )
+    if estado_actual == "rechazado" and nuevo_estado not in ("rechazado", "anulado"):
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="Un pago rechazado no puede pasar a aprobado; genere un nuevo pago o anúlelo.",
+        )
+
+    staff_db: Client = staff_ctx["supabase"]
+    try:
+        res_rpc = staff_db.rpc(
+            "rpc_actualizar_estado_pago",
+            {
+                "p_id_pago": id_pago,
+                "p_estado": nuevo_estado,
+            },
+        ).execute()
+        pago_actualizado = get_data(res_rpc)
+    except Exception as exc:
+        raise HTTPException(
+            status_code=_map_rpc_error_status(exc),
+            detail=f"No fue posible actualizar el estado del pago: {exc}",
+        ) from exc
 
     return {
-        "mensaje": "Estado actualizado correctamente.",
+        "mensaje": "Estado del pago actualizado correctamente.",
         "pago": pago_actualizado,
     }
 
 
-@router.delete("/{id}", status_code=status.HTTP_200_OK)
-async def eliminar_pago(id: int = Path(...)):
-    """Eliminar un registro de pago."""
-    res = supabase.from_("pago").delete().eq("id_pago", id).execute()
-    if not res.data:
-        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="El pago que deseas eliminar no existe.")
-
+@router.delete("/{id_pago}", status_code=status.HTTP_200_OK)
+async def anular_pago(
+    id_pago: int = Path(..., gt=0),
+    current_user: Dict[str, Any] = Depends(get_current_user),
+):
+    """
+    Anulación lógica de un pago (`estado = 'anulado'`) mediante `public.rpc_actualizar_estado_pago`.
+    Está prohibido eliminar físicamente registros de `public.pago` (`trg_proteger_pago_inmutable`).
+    """
+    res = await actualizar_estado_pago(
+        req=PagoUpdateEstado(estado="anulado"),
+        id_pago=id_pago,
+        current_user=current_user,
+    )
     return {
-        "mensaje": "Pago eliminado exitosamente.",
-        "pago": res.data[0],
+        "mensaje": "Pago anulado lógicamente conservando el historial contable.",
+        "anulado": True,
+        "pago": res["pago"],
     }

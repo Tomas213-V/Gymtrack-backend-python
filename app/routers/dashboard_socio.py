@@ -1,18 +1,11 @@
-import re
 import time
-import urllib.parse
-from datetime import datetime, date, timedelta, timezone
+from datetime import date
 from typing import Dict, Any, Optional, List
-import httpx
 from fastapi import APIRouter, HTTPException, status, Depends, Query, Request
-from app.config import (
-    supabase,
-    MERCADOPAGO_ACCESS_TOKEN,
-    FRONTEND_URL,
-)
+from supabase import Client
+
 from app.core.dependencies import get_current_user
 from app.services.utils import (
-    formatear_fecha_espanol,
     formatear_precio_ars,
     calcular_metricas_membresia,
     get_data,
@@ -23,489 +16,361 @@ from app.services.payment_service import (
     crear_orden_uala,
 )
 from app.models.dashboard_socio import (
-    ProgresoCreate,
-    ActualizarMembresiaSocio,
+    CheckinSocioRequest,
+    SolicitarMembresiaSocio,
     IniciarPagoSocio,
-    ConfirmarPagoSocio,
+)
+from app.routers.socios import (
+    _resolve_socio_profile_context,
+    _fetch_socio_gimnasios_for_socio,
+)
+from app.routers.planes_membresia import PLAN_COLUMNS
+from app.routers.membresias import (
+    MEMBRESIA_SOCIO_SELECT,
+    _map_rpc_error_status,
+)
+from app.routers.pagos import (
+    PAGO_SELECT,
+    _extract_socio_id_from_pago,
+    _extract_gym_id_from_pago,
+)
+from app.routers.asistencias import (
+    ASISTENCIA_SELECT,
+    _extract_gym_id_from_asistencia,
+    _map_asistencia_rpc_error,
+)
+from app.routers.rutinas import (
+    RUTINA_SOCIO_SELECT,
+    ASIGNACION_SELECT,
+    _sort_rutina_items,
 )
 
-router = APIRouter(prefix="/api/socio", tags=["Panel Socio y Pagos"])
+router = APIRouter(prefix="/api/socio", tags=["Panel Socio"])
 
 
-async def resolver_id_socio(current_user: Dict[str, Any], query_id: Optional[int] = None) -> Optional[int]:
-    """Resuelve el ID de socio según el token JWT o consulta administrativa."""
-    if current_user.get("id_socio"):
-        return int(current_user["id_socio"])
-
-    if current_user.get("id_usuario"):
-        res = (
-            supabase.from_("socio")
-            .select("id_socio")
-            .eq("id_usuario", current_user["id_usuario"])
-            .maybe_single()
-            .execute()
-        )
-        socio_data = get_data(res)
-        if socio_data:
-            return int(socio_data["id_socio"])
-
-    if query_id and current_user.get("rol") in ("dueño", "administrador"):
-        return int(query_id)
-
-    return None
-
-
-async def obtener_socio_autenticado(current_user: Dict[str, Any]) -> Optional[Dict[str, Any]]:
-    """Obtiene los datos completos del socio autenticado."""
-    id_socio = await resolver_id_socio(current_user)
-    if not id_socio:
-        return None
-
-    res = (
-        supabase.from_("socio")
-        .select("id_socio, id_gimnasio, nombre, apellido, dni, email, telefono, estado, fecha_alta")
-        .eq("id_socio", id_socio)
-        .maybe_single()
-        .execute()
-    )
-    return get_data(res)
+def _select_active_gym_for_socio(
+    asociaciones: List[Dict[str, Any]],
+    requested_gym_id: Optional[int],
+) -> Optional[Dict[str, Any]]:
+    by_gym = {
+        int(a["id_gimnasio"]): a
+        for a in asociaciones
+        if isinstance(a, dict) and a.get("id_gimnasio") is not None
+    }
+    if requested_gym_id is not None:
+        if requested_gym_id not in by_gym:
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail="No posees asociación con el gimnasio solicitado.",
+            )
+        return by_gym[requested_gym_id]
+    activas = [a for a in asociaciones if isinstance(a, dict) and a.get("estado") is True]
+    if activas:
+        return activas[0]
+    return asociaciones[0] if asociaciones else None
 
 
 # ==============================================================================
-# WEBHOOK PÚBLICO
+# WEBHOOK EXTERNO (RECEPTOR DE NOTIFICACIONES SIN SERVICE_ROLE)
 # ==============================================================================
 
 @router.post("/pagos/webhook", status_code=status.HTTP_200_OK)
 async def webhook_pago(request: Request, proveedor: Optional[str] = Query("mercadopago")):
-    """Endpoint público para webhooks de pasarelas de pago."""
+    """Receptor de notificaciones de pasarela (sin acreditación automática hasta validar firma HMAC)."""
     try:
         body = await request.json()
     except Exception:
         body = {}
-
-    query_params = dict(request.query_params)
-    print(f"[WEBHOOK {proveedor.upper()}] Recibido payload:", body or query_params)
-
-    # Procesar notificación básica
-    return {"recibido": True, "proveedor": proveedor}
+    return {
+        "recibido": True,
+        "proveedor": proveedor,
+        "requiere_verificacion_firma": True,
+        "evento_detectado": bool(body or dict(request.query_params)),
+    }
 
 
 # ==============================================================================
-# DASHBOARD GENERAL DEL SOCIO
+# DASHBOARD GENERAL DEL SOCIO (MULTI-GIMNASIO, SIN TABLA `progreso`)
 # ==============================================================================
 
 @router.get("/dashboard", status_code=status.HTTP_200_OK)
 async def get_dashboard_socio(
-    id: Optional[int] = Query(None),
-    current_user: Dict[str, Any] = Depends(get_current_user)
+    id_gimnasio: Optional[int] = Query(default=None, gt=0),
+    current_user: Dict[str, Any] = Depends(get_current_user),
 ):
-    """Carga todas las métricas, membresía, rutinas y progreso para el panel del socio."""
-    id_socio = await resolver_id_socio(current_user, id)
-    if not id_socio:
-        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Usuario no autenticado como socio.")
+    """
+    Panel integral del socio autenticado adaptado al modelo definitivo de Supabase:
+    - Identidad global del socio (`public.socio`, sin `id_gimnasio`).
+    - Asociaciones multi-gimnasio (`public.socio_gimnasio`).
+    - Membresía vigente (`public.membresia_socio` + `public.membresia_gimnasio`).
+    - Último pago (`public.pago`).
+    - Asistencias (`public.asistencia_socio` con sucursal, excluyendo anuladas).
+    - Rutinas separadas: personales (`public.rutina_socio`) y asignadas (`public.rutinas_asignadas_socio_gimnasio`).
+    - Sin tabla ni bloque `progreso` (eliminada del esquema definitivo).
+    """
+    socio_ctx = _resolve_socio_profile_context(current_user)
+    own_socio_id = int(socio_ctx["id_socio"])
+    db: Client = socio_ctx["supabase"]
 
-    # 1. Socio y gimnasio
+    req_gym = id_gimnasio or current_user.get("requested_gym_id")
+
     res_socio = (
-        supabase.from_("socio")
-        .select("""
-            id_socio,
-            id_gimnasio,
-            dni,
-            telefono,
-            fecha_alta,
-            estado,
-            nombre,
-            apellido,
-            email,
-            gimnasio (
-                id_gimnasio,
-                nombre,
-                direccion,
-                telefono,
-                email
-            )
-        """)
-        .eq("id_socio", id_socio)
+        db.from_("socio")
+        .select("id_socio, dni, telefono, fecha_alta, estado, nombre, apellido, email")
+        .eq("id_socio", own_socio_id)
         .maybe_single()
         .execute()
     )
     socio = get_data(res_socio)
-    if not socio:
-        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="No se encontraron datos del socio en el sistema.")
+    if not isinstance(socio, dict):
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="No se encontraron datos del socio en el sistema.",
+        )
 
-    # 2. Membresías del socio (para resolver membresía activa vigente)
-    res_memb = (
-        supabase.from_("membresia")
-        .select("""
-            id_membresia,
-            id_plan_membresia,
-            precio,
-            fecha_inicio,
-            fecha_vencimiento,
-            estado,
-            plan_membresia (
-                id_plan_membresia,
-                nombre,
-                descripcion,
-                precio,
-                duracion_dias,
-                estado
-            )
-        """)
-        .eq("id_socio", id_socio)
-        .order("fecha_vencimiento", desc=True)
-        .execute()
-    )
-    raw_membresias = res_memb.data or []
-    ESTADOS_EXCLUIDOS = [
-        "inactivo", "inactiva", "pausa", "pausado", "pausada",
-        "cancelado", "cancelada", "eliminado", "eliminada", "sin_membresia"
+    asociaciones = _fetch_socio_gimnasios_for_socio(db, own_socio_id)
+    assoc_activa = _select_active_gym_for_socio(asociaciones, int(req_gym) if req_gym else None)
+    selected_gym_id = int(assoc_activa["id_gimnasio"]) if assoc_activa else None
+    selected_sg_id = int(assoc_activa["id_socio_gimnasio"]) if assoc_activa else None
+    gimnasio_activo = assoc_activa.get("gimnasio") if isinstance(assoc_activa, dict) else None
+
+    # 1. Membresía vigente en el gimnasio seleccionado
+    membresia_actual: Optional[Dict[str, Any]] = None
+    if selected_sg_id is not None:
+        res_m = (
+            db.from_("membresia_socio")
+            .select(MEMBRESIA_SOCIO_SELECT)
+            .eq("id_socio_gimnasio", selected_sg_id)
+            .order("fecha_vencimiento", desc=True)
+            .execute()
+        )
+        raw_m = [
+            m for m in (get_data(res_m) or [])
+            if isinstance(m, dict) and int(m.get("id_socio_gimnasio") or 0) == selected_sg_id
+        ]
+        membresia_actual = next(
+            (m for m in raw_m if str(m.get("estado") or "").lower() == "activa"),
+            next((m for m in raw_m if str(m.get("estado") or "").lower() == "pendiente"), None),
+        )
+
+    metricas_membresia = calcular_metricas_membresia(membresia_actual)
+
+    # 2. Último pago del socio (en el gimnasio seleccionado si existe)
+    res_pagos = db.from_("pago").select(PAGO_SELECT).order("fecha_pago", desc=True).execute()
+    pagos_propios = [
+        p for p in (get_data(res_pagos) or [])
+        if isinstance(p, dict)
+        and _extract_socio_id_from_pago(p) == own_socio_id
+        and (selected_gym_id is None or _extract_gym_id_from_pago(p) == selected_gym_id)
     ]
-    membresia = next(
-        (
-            m for m in raw_membresias
-            if (m.get("estado") or "").lower().strip() not in ESTADOS_EXCLUIDOS
-            and (((m.get("plan_membresia") or {}).get("estado") or "").lower().strip() not in ESTADOS_EXCLUIDOS if m.get("plan_membresia") else True)
-        ),
-        None
-    )
+    ultimo_pago = pagos_propios[0] if pagos_propios else None
 
-    # 3. Último pago
-    res_pago = (
-        supabase.from_("pago")
-        .select("id_pago, monto, fecha_pago, metodo_pago, estado, comprobante, id_membresia, membresia!inner(id_socio)")
-        .eq("membresia.id_socio", id_socio)
-        .order("fecha_pago", desc=True)
-        .limit(1)
-        .maybe_single()
-        .execute()
-    )
-    ultimo_pago = get_data(res_pago)
-
-    # 4. Progresos
-    res_prog_ultimo = (
-        supabase.from_("progreso")
-        .select("id_progreso, peso, fecha, observaciones")
-        .eq("id_socio", id_socio)
-        .order("fecha", desc=True)
-        .limit(1)
-        .maybe_single()
-        .execute()
-    )
-    ultimo_progreso = get_data(res_prog_ultimo)
-
-    res_prog_hist = (
-        supabase.from_("progreso")
-        .select("id_progreso, peso, fecha, observaciones")
-        .eq("id_socio", id_socio)
-        .order("fecha", desc=True)
-        .limit(6)
-        .execute()
-    )
-    historial_progreso = res_prog_hist.data or []
-
-    # 5. Asistencias
+    # 3. Asistencias del socio (`public.asistencia_socio`, excluyendo anuladas)
     hoy = date.today()
     inicio_mes = date(hoy.year, hoy.month, 1).isoformat()
-    res_asist_tot = supabase.from_("asistencia").select("id_asistencia", count="exact").eq("id_socio", id_socio).execute()
-    res_asist_mes = (
-        supabase.from_("asistencia")
-        .select("id_asistencia", count="exact")
-        .eq("id_socio", id_socio)
-        .gte("hora_ingreso", inicio_mes)
-        .execute()
-    )
-    res_asist_rec = (
-        supabase.from_("asistencia")
-        .select("id_asistencia, hora_ingreso, hora_salida, estado")
-        .eq("id_socio", id_socio)
+    res_asist = (
+        db.from_("asistencia_socio")
+        .select(ASISTENCIA_SELECT)
+        .eq("id_socio", own_socio_id)
         .order("hora_ingreso", desc=True)
-        .limit(5)
         .execute()
     )
+    asist_validas = [
+        a for a in (get_data(res_asist) or [])
+        if isinstance(a, dict)
+        and int(a.get("id_socio") or 0) == own_socio_id
+        and str(a.get("estado") or "").lower() != "anulada"
+        and (selected_gym_id is None or _extract_gym_id_from_asistencia(a) == selected_gym_id)
+    ]
+    asistencias_mes = sum(
+        1 for a in asist_validas if str(a.get("hora_ingreso") or "").split("T")[0] >= inicio_mes
+    )
 
-    total_asistencias = res_asist_tot.count or 0
-    asistencias_mes = res_asist_mes.count or 0
-    asistencias_recientes = res_asist_rec.data or []
-
-    # 6. Rutina activa
-    res_rutina = (
-        supabase.from_("rutina")
-        .select("""
-            id_rutina,
-            nombre,
-            descripcion,
-            estado,
-            rutina_ejercicio (
-                id_rutina_ejercicio,
-                series,
-                repeticiones,
-                peso,
-                descanso,
-                orden,
-                ejercicio (
-                    id_ejercicio,
-                    nombre,
-                    grupo_muscular,
-                    dificultad
-                )
-            )
-        """)
-        .eq("id_socio", id_socio)
-        .order("id_rutina", desc=True)
-        .limit(1)
-        .maybe_single()
+    # 4. Rutinas personales (`public.rutina_socio`) y asignadas (`public.rutinas_asignadas_socio_gimnasio`)
+    res_rp = (
+        db.from_("rutina_socio")
+        .select(RUTINA_SOCIO_SELECT)
+        .eq("id_socio", own_socio_id)
+        .order("id_rutina_socio", desc=True)
         .execute()
     )
-    rutina_activa = get_data(res_rutina)
+    rutinas_personales = [
+        _sort_rutina_items(r, "rutina_ejercicio_socio")
+        for r in (get_data(res_rp) or [])
+        if isinstance(r, dict) and int(r.get("id_socio") or 0) == own_socio_id and r.get("estado") is True
+    ]
 
-    # Métricas membresía
-    dias_restantes = None
-    porcentaje_transcurrido = None
-    membresia_expirada = False
+    rutinas_asignadas: List[Dict[str, Any]] = []
+    if selected_sg_id is not None:
+        res_ra = (
+            db.from_("rutinas_asignadas_socio_gimnasio")
+            .select(ASIGNACION_SELECT)
+            .eq("id_socio_gimnasio", selected_sg_id)
+            .order("id_rutina_asignada", desc=True)
+            .execute()
+        )
+        rutinas_asignadas = [
+            a for a in (get_data(res_ra) or [])
+            if isinstance(a, dict)
+            and int(a.get("id_socio_gimnasio") or 0) == selected_sg_id
+            and a.get("estado") is True
+        ]
 
-    if membresia and membresia.get("fecha_vencimiento"):
-        try:
-            fv = date.fromisoformat(str(membresia["fecha_vencimiento"]).split("T")[0])
-            dias_restantes = (fv - hoy).days
-            membresia_expirada = dias_restantes < 0
-
-            fi = date.fromisoformat(str(membresia.get("fecha_inicio") or (fv - timedelta(days=30))).split("T")[0])
-            tot_d = max(1, (fv - fi).days)
-            usados_d = max(0, (hoy - fi).days)
-            porcentaje_transcurrido = min(100, max(0, round((usados_d / tot_d) * 100)))
-        except Exception:
-            pass
-
-    # Variación de peso
-    variacion_peso = None
-    if len(historial_progreso) >= 2:
-        try:
-            actual = float(historial_progreso[0]["peso"])
-            previo = float(historial_progreso[1]["peso"])
-            variacion_peso = round(actual - previo, 1)
-        except Exception:
-            pass
-
-    # Ordenar ejercicios
-    ejercicios_ordenados = []
-    if rutina_activa and rutina_activa.get("rutina_ejercicio"):
-        ejercicios_ordenados = sorted(rutina_activa["rutina_ejercicio"], key=lambda x: x.get("orden") or 0)
-
-    plan_info = membresia.get("plan_membresia") if membresia else None
-    plan_nombre = plan_info.get("nombre") if plan_info else "Plan Personalizado"
-    plan_precio = (membresia.get("precio") or (plan_info.get("precio") if plan_info else 0)) if membresia else 0
-
-    return {
-        "socio": {
-            "id_socio": socio["id_socio"],
-            "nombre": socio.get("nombre"),
-            "apellido": socio.get("apellido"),
-            "dni": socio.get("dni"),
-            "email": socio.get("email"),
-            "telefono": socio.get("telefono"),
-        },
-        "gimnasio": socio.get("gimnasio") or {
-            "nombre": "GymTrack Fitness Club",
-            "direccion": "Av. Central 1234",
-            "telefono": "+54 11 5555-8888",
-        },
-        "membresia": {
-            "id_membresia": membresia["id_membresia"],
-            "plan": plan_nombre,
-            "estado": membresia.get("estado"),
-            "fecha_inicio": membresia.get("fecha_inicio"),
-            "fecha_vencimiento": membresia.get("fecha_vencimiento"),
-            "precio": plan_precio,
-            "dias_restantes": dias_restantes,
-            "porcentaje_transcurrido": porcentaje_transcurrido,
-            "expirada": membresia_expirada,
-        } if membresia else {
-            "id_membresia": None,
+    plan_obj = (
+        membresia_actual.get("membresia_gimnasio")
+        if isinstance(membresia_actual, dict) and isinstance(membresia_actual.get("membresia_gimnasio"), dict)
+        else {}
+    )
+    membresia_payload = (
+        {
+            "id_membresia_socio": membresia_actual["id_membresia_socio"],
+            "id_membresia_gimnasio": membresia_actual.get("id_membresia_gimnasio"),
+            "id_gimnasio": membresia_actual.get("id_gimnasio"),
+            "plan": plan_obj.get("nombre") or "Plan Contratado",
+            "estado": membresia_actual.get("estado"),
+            "fecha_inicio": membresia_actual.get("fecha_inicio"),
+            "fecha_vencimiento": membresia_actual.get("fecha_vencimiento"),
+            "precio": float(membresia_actual.get("precio") or 0),
+            "dias_restantes": metricas_membresia["dias_restantes"],
+            "porcentaje_transcurrido": metricas_membresia["porcentaje_transcurrido"],
+            "expirada": metricas_membresia["esta_vencida"],
+        }
+        if membresia_actual
+        else {
+            "id_membresia_socio": None,
             "estado": "sin_membresia",
             "plan": "Sin Membresía Activa",
-            "mensaje": "No tienes una membresía activa asignada actualmente.",
             "dias_restantes": 0,
             "porcentaje_transcurrido": 0,
             "expirada": True,
-        },
+        }
+    )
+
+    return {
+        "socio": socio,
+        "gimnasio_activo": gimnasio_activo,
+        "gimnasios_asociados": asociaciones,
+        "membresia": membresia_payload,
         "ultimo_pago": ultimo_pago,
-        "progreso": {
-            "peso_actual": ultimo_progreso.get("peso") if ultimo_progreso else None,
-            "observaciones": ultimo_progreso.get("observaciones") if ultimo_progreso else None,
-            "fecha_ultimo_registro": ultimo_progreso.get("fecha") if ultimo_progreso else None,
-            "variacion_mes": variacion_peso,
-            "historial": historial_progreso,
-        },
         "entrenamientos": {
-            "total_asistencias": total_asistencias,
+            "total_asistencias": len(asist_validas),
             "asistencias_mes": asistencias_mes,
-            "recientes": asistencias_recientes,
+            "recientes": asist_validas[:5],
         },
-        "rutina_activa": {
-            "id_rutina": rutina_activa["id_rutina"],
-            "nombre": rutina_activa.get("nombre"),
-            "descripcion": rutina_activa.get("descripcion"),
-            "ejercicios": ejercicios_ordenados,
-        } if rutina_activa else None,
-        "acciones_rapidas": [
-            {"clave": "ver_rutina", "titulo": "Mi Rutina", "activo": bool(rutina_activa), "link": "/rutinas"},
-            {"clave": "mi_membresia", "titulo": "Membresía", "activo": True, "link": "/socio/membresia"},
-            {"clave": "asistencias", "titulo": "Asistencias", "activo": True, "link": "/asistencias"},
-            {"clave": "ejercicios", "titulo": "Ejercicios", "activo": True, "link": "/ejercicios"},
-            {"clave": "perfil", "titulo": "Mi Perfil", "activo": True, "link": "/perfil"},
-        ],
+        "rutinas_personales": rutinas_personales,
+        "rutinas_asignadas": rutinas_asignadas,
     }
 
 
 @router.post("/checkin", status_code=status.HTTP_201_CREATED)
-async def registrar_checkin_socio(current_user: Dict[str, Any] = Depends(get_current_user)):
-    """Permite al socio marcar su asistencia directamente desde su panel."""
-    id_socio = await resolver_id_socio(current_user)
-    if not id_socio:
-        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Usuario no autenticado como socio.")
-
-    now_iso = datetime.now(timezone.utc).isoformat()
-    res = (
-        supabase.from_("asistencia")
-        .insert([{
-            "id_socio": id_socio,
-            "hora_ingreso": now_iso,
-            "estado": "presente",
-        }])
-        .execute()
-    )
-    if not res.data:
-        raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail="Error al registrar check-in.")
-
-    return {
-        "mensaje": "¡Asistencia registrada con éxito! Que tengas un gran entrenamiento 💪",
-        "asistencia": res.data[0],
-    }
-
-
-@router.post("/progreso", status_code=status.HTTP_201_CREATED)
-async def registrar_progreso_socio(
-    req: ProgresoCreate,
-    current_user: Dict[str, Any] = Depends(get_current_user)
+async def registrar_checkin_socio(
+    req: CheckinSocioRequest,
+    current_user: Dict[str, Any] = Depends(get_current_user),
 ):
-    """Permite al socio cargar su peso actual y notas desde su panel."""
-    id_socio = await resolver_id_socio(current_user)
-    if not id_socio:
-        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Usuario no autenticado como socio.")
+    """
+    Registra el ingreso del socio autenticado en una sucursal específica utilizando
+    exclusivamente `public.rpc_registrar_ingreso_asistencia`.
+    """
+    socio_ctx = _resolve_socio_profile_context(current_user)
+    own_socio_id = int(socio_ctx["id_socio"])
+    db: Client = socio_ctx["supabase"]
 
-    fecha_registro = req.fecha or date.today().isoformat()
-    res = (
-        supabase.from_("progreso")
-        .insert([{
-            "id_socio": id_socio,
-            "peso": float(req.peso),
-            "fecha": fecha_registro,
-            "observaciones": req.observaciones or None,
-        }])
-        .execute()
-    )
-    if not res.data:
-        raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail="Error al registrar el progreso.")
+    try:
+        res_rpc = db.rpc(
+            "rpc_registrar_ingreso_asistencia",
+            {
+                "p_id_sucursal": req.id_sucursal,
+                "p_id_socio": own_socio_id,
+            },
+        ).execute()
+        asistencia = get_data(res_rpc)
+    except Exception as exc:
+        raise HTTPException(
+            status_code=_map_asistencia_rpc_error(exc),
+            detail=f"No fue posible registrar el check-in: {exc}",
+        ) from exc
 
     return {
-        "mensaje": "¡Peso registrado exitosamente!",
-        "progreso": res.data[0],
+        "mensaje": "Asistencia registrada con éxito.",
+        "asistencia": asistencia,
     }
 
 
 # ==============================================================================
-# MÓDULO DE MI MEMBRESÍA DEL SOCIO
+# MEMBRESÍA Y PLANES DEL SOCIO (SOLO ESQUEMA DEFINITIVO, SIN AUTOSEMBRADO)
 # ==============================================================================
 
 @router.get("/membresia", status_code=status.HTTP_200_OK)
-async def get_mi_membresia(current_user: Dict[str, Any] = Depends(get_current_user)):
-    """Obtener información completa de la membresía del socio, métricas y pagos."""
-    socio = await obtener_socio_autenticado(current_user)
-    if not socio:
-        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Acceso no autorizado. Perfil no identificado.")
+async def get_mi_membresia(
+    id_gimnasio: Optional[int] = Query(default=None, gt=0),
+    current_user: Dict[str, Any] = Depends(get_current_user),
+):
+    """Devuelve la membresía vigente, historial de pagos y planes activos del gimnasio asociado."""
+    socio_ctx = _resolve_socio_profile_context(current_user)
+    own_socio_id = int(socio_ctx["id_socio"])
+    db: Client = socio_ctx["supabase"]
 
-    # 1. Membresía más reciente vigente (excluyendo pausadas/inactivas/canceladas)
+    asociaciones = _fetch_socio_gimnasios_for_socio(db, own_socio_id)
+    assoc = _select_active_gym_for_socio(asociaciones, id_gimnasio)
+    if not assoc:
+        return {
+            "id_socio": own_socio_id,
+            "membresia": None,
+            "metricas": calcular_metricas_membresia(None),
+            "pagos": [],
+            "planes_disponibles": [],
+        }
+
+    gym_id = int(assoc["id_gimnasio"])
+    sg_id = int(assoc["id_socio_gimnasio"])
+
     res_m = (
-        supabase.from_("membresia")
-        .select("""
-            *,
-            plan_membresia (*)
-        """)
-        .eq("id_socio", socio["id_socio"])
+        db.from_("membresia_socio")
+        .select(MEMBRESIA_SOCIO_SELECT)
+        .eq("id_socio_gimnasio", sg_id)
         .order("fecha_vencimiento", desc=True)
         .execute()
     )
-    raw_membresias = res_m.data or []
-    ESTADOS_EXCLUIDOS = [
-        "inactivo", "inactiva", "pausa", "pausado", "pausada",
-        "cancelado", "cancelada", "eliminado", "eliminada", "sin_membresia"
+    raw_m = [
+        m for m in (get_data(res_m) or [])
+        if isinstance(m, dict) and int(m.get("id_socio_gimnasio") or 0) == sg_id
     ]
     membresia = next(
-        (
-            m for m in raw_membresias
-            if (m.get("estado") or "").lower().strip() not in ESTADOS_EXCLUIDOS
-            and (((m.get("plan_membresia") or {}).get("estado") or "").lower().strip() not in ESTADOS_EXCLUIDOS if m.get("plan_membresia") else True)
-        ),
-        None
+        (m for m in raw_m if str(m.get("estado") or "").lower() == "activa"),
+        next((m for m in raw_m if str(m.get("estado") or "").lower() == "pendiente"), None),
     )
 
-    # 2. Historial de pagos
-    res_pagos = (
-        supabase.from_("pago")
-        .select("""
-            id_pago,
-            monto,
-            fecha_pago,
-            metodo_pago,
-            estado,
-            comprobante,
-            membresia!inner(id_socio)
-        """)
-        .eq("membresia.id_socio", socio["id_socio"])
-        .order("fecha_pago", desc=True)
-        .limit(10)
+    res_pagos = db.from_("pago").select(PAGO_SELECT).order("fecha_pago", desc=True).execute()
+    pagos = [
+        p for p in (get_data(res_pagos) or [])
+        if isinstance(p, dict)
+        and _extract_socio_id_from_pago(p) == own_socio_id
+        and _extract_gym_id_from_pago(p) == gym_id
+    ][:10]
+
+    res_pl = (
+        db.from_("membresia_gimnasio")
+        .select(PLAN_COLUMNS)
+        .eq("id_gimnasio", gym_id)
+        .order("precio", desc=False)
         .execute()
     )
-    pagos = res_pagos.data or []
-
-    # 3. Planes disponibles
-    planes = []
-    if socio.get("id_gimnasio"):
-        res_pl = (
-            supabase.from_("plan_membresia")
-            .select("*")
-            .eq("id_gimnasio", socio["id_gimnasio"])
-            .order("precio", desc=False)
-            .execute()
-        )
-        planes_raw = res_pl.data or []
-        if not planes_raw:
-            planes_semilla = [
-                {"id_gimnasio": socio["id_gimnasio"], "nombre": "Plan Básico", "precio": 15000, "duracion_dias": 30, "estado": "Activo"},
-                {"id_gimnasio": socio["id_gimnasio"], "nombre": "Plan Premium", "precio": 22000, "duracion_dias": 30, "estado": "Activo"},
-                {"id_gimnasio": socio["id_gimnasio"], "nombre": "Pase Libre Total", "precio": 28000, "duracion_dias": 30, "estado": "Activo"}
-            ]
-            try:
-                res_ins = supabase.from_("plan_membresia").insert(planes_semilla).execute()
-                planes_raw = res_ins.data or planes_semilla
-            except Exception:
-                planes_raw = planes_semilla
-
-        planes = [p for p in planes_raw if not p.get("estado") or (p.get("estado") or "").lower() == "activo"]
+    planes = [
+        p for p in (get_data(res_pl) or [])
+        if isinstance(p, dict) and int(p.get("id_gimnasio") or 0) == gym_id and p.get("estado") is True
+    ]
 
     metricas = calcular_metricas_membresia(membresia)
-
-    # Armar datos enriquecidos de membresía
     membresia_resp = None
     if membresia:
-        plan_obj = membresia.get("plan_membresia") or {}
-        precio_monto = float(membresia.get("precio") or plan_obj.get("precio", 0))
+        plan_obj = membresia.get("membresia_gimnasio") if isinstance(membresia.get("membresia_gimnasio"), dict) else {}
+        precio_monto = float(membresia.get("precio") or 0)
         membresia_resp = {
             "tiene_membresia": metricas["tiene_membresia"],
-            "id_membresia": membresia["id_membresia"],
-            "id_plan_membresia": membresia.get("id_plan_membresia"),
-            "nombre_plan": plan_obj.get("nombre", "Plan Estándar"),
+            "id_membresia_socio": membresia["id_membresia_socio"],
+            "id_membresia_gimnasio": membresia.get("id_membresia_gimnasio"),
+            "id_gimnasio": gym_id,
+            "nombre_plan": plan_obj.get("nombre", "Plan Contratado"),
             "precio": precio_monto,
             "precio_formateado": formatear_precio_ars(precio_monto),
             "fecha_inicio": membresia.get("fecha_inicio"),
@@ -521,251 +386,218 @@ async def get_mi_membresia(current_user: Dict[str, Any] = Depends(get_current_us
         }
 
     return {
-        "socio": socio,
+        "id_socio": own_socio_id,
+        "id_gimnasio": gym_id,
         "membresia": membresia_resp,
         "metricas": metricas,
         "pagos": pagos,
-        "historial_pagos": pagos,
         "planes_disponibles": planes,
     }
 
 
 @router.get("/planes-disponibles", status_code=status.HTTP_200_OK)
-async def get_planes_disponibles(current_user: Dict[str, Any] = Depends(get_current_user)):
-    """Obtener planes disponibles exclusivos del gimnasio del socio con cálculo de beneficios y upgrades."""
-    socio = await obtener_socio_autenticado(current_user)
-    if not socio:
+async def get_planes_disponibles(
+    id_gimnasio: Optional[int] = Query(default=None, gt=0),
+    current_user: Dict[str, Any] = Depends(get_current_user),
+):
+    """Lista los planes activos (`public.membresia_gimnasio`) del gimnasio asociado al socio (sin autosembrado)."""
+    socio_ctx = _resolve_socio_profile_context(current_user)
+    own_socio_id = int(socio_ctx["id_socio"])
+    db: Client = socio_ctx["supabase"]
+
+    asociaciones = _fetch_socio_gimnasios_for_socio(db, own_socio_id)
+    assoc = _select_active_gym_for_socio(asociaciones, id_gimnasio)
+    if not assoc or assoc.get("estado") is not True:
         raise HTTPException(
-            status_code=status.HTTP_401_UNAUTHORIZED,
-            detail="Acceso no autorizado. Perfil de socio no encontrado."
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Necesitas una asociación activa en el gimnasio para consultar sus planes.",
         )
 
-    # 1. Obtener la membresía actual para comparar y clasificar planes superiores
-    res_memb = (
-        supabase.from_("membresia")
-        .select("id_membresia, id_plan_membresia, precio, estado")
-        .eq("id_socio", socio["id_socio"])
+    gym_id = int(assoc["id_gimnasio"])
+    sg_id = int(assoc["id_socio_gimnasio"])
+
+    res_m = (
+        db.from_("membresia_socio")
+        .select("id_membresia_socio, id_membresia_gimnasio, precio, estado, fecha_vencimiento")
+        .eq("id_socio_gimnasio", sg_id)
         .order("fecha_vencimiento", desc=True)
-        .limit(1)
-        .maybe_single()
         .execute()
     )
-    memb_actual = get_data(res_memb)
-    plan_actual_id = memb_actual.get("id_plan_membresia") if memb_actual else None
-    precio_actual = float(memb_actual.get("precio", 0) or 0) if memb_actual else 0.0
+    raw_m = [m for m in (get_data(res_m) or []) if isinstance(m, dict)]
+    memb_actual = next((m for m in raw_m if str(m.get("estado") or "").lower() == "activa"), None)
+    plan_actual_id = memb_actual.get("id_membresia_gimnasio") if memb_actual else None
+    precio_actual = float(memb_actual.get("precio") or 0) if memb_actual else 0.0
 
-    # 2. Consultar planes de membresía que pertenecen al gimnasio del socio
-    res_planes = (
-        supabase.from_("plan_membresia")
-        .select("*")
-        .eq("id_gimnasio", socio.get("id_gimnasio"))
+    res_pl = (
+        db.from_("membresia_gimnasio")
+        .select(PLAN_COLUMNS)
+        .eq("id_gimnasio", gym_id)
         .order("precio", desc=False)
         .execute()
     )
-    planes = res_planes.data or []
-
-    # Si el gimnasio aún no tiene planes cargados, sembrar 3 planes predeterminados para dicho gimnasio
-    if not planes and socio.get("id_gimnasio"):
-        planes_semilla = [
-            {"id_gimnasio": socio["id_gimnasio"], "nombre": "Plan Básico", "precio": 15000, "duracion_dias": 30, "estado": "Activo"},
-            {"id_gimnasio": socio["id_gimnasio"], "nombre": "Plan Premium", "precio": 22000, "duracion_dias": 30, "estado": "Activo"},
-            {"id_gimnasio": socio["id_gimnasio"], "nombre": "Pase Libre Total", "precio": 28000, "duracion_dias": 30, "estado": "Activo"}
-        ]
-        try:
-            res_ins = supabase.from_("plan_membresia").insert(planes_semilla).execute()
-            planes = res_ins.data or planes_semilla
-        except Exception:
-            planes = planes_semilla
-
-    # 3. Estructurar y clasificar planes para el frontend (excluyendo pausados, inactivos, cancelados)
-    ESTADOS_MEMBRESIA_INACTIVOS = [
-        "inactivo", "inactiva", "pausa", "pausado", "pausada",
-        "cancelado", "cancelada", "eliminado", "eliminada"
+    planes_activos = [
+        p for p in (get_data(res_pl) or [])
+        if isinstance(p, dict) and int(p.get("id_gimnasio") or 0) == gym_id and p.get("estado") is True
     ]
+
     planes_formateados = []
-    for plan in (planes or []):
-        est = (plan.get("estado") or "").lower().strip()
-        if est in ESTADOS_MEMBRESIA_INACTIVOS or (est and est not in ("activo", "activa")):
-            continue
-
-        precio_num = float(plan.get("precio", 0) or 0)
-        duracion = plan.get("duracion_dias", 30) or 30
-        es_plan_actual = plan.get("id_plan_membresia") == plan_actual_id
-        es_superior = (not es_plan_actual) and (precio_num > precio_actual)
+    for plan in planes_activos:
+        precio_num = float(plan.get("precio") or 0)
+        duracion = int(plan.get("duracion_dias") or 30)
+        es_plan_actual = plan.get("id_membresia_gimnasio") == plan_actual_id
         diferencia = precio_num - precio_actual
-
-        planes_formateados.append({
-            "id_plan_membresia": plan.get("id_plan_membresia"),
-            "id_gimnasio": plan.get("id_gimnasio"),
-            "nombre": plan.get("nombre"),
-            "precio": precio_num,
-            "precio_formateado": formatear_precio_ars(precio_num),
-            "duracion_dias": duracion,
-            "duracion_texto": f"{duracion} días",
-            "estado": plan.get("estado"),
-            "es_plan_actual": es_plan_actual,
-            "es_superior": es_superior,
-            "diferencia_precio": diferencia if diferencia > 0 else 0,
-            "diferencia_precio_formateada": formatear_precio_ars(diferencia) if diferencia > 0 else None,
-            "beneficios": sugerir_beneficios(plan.get("nombre")),
-        })
+        planes_formateados.append(
+            {
+                "id_membresia_gimnasio": plan.get("id_membresia_gimnasio"),
+                "id_gimnasio": gym_id,
+                "nombre": plan.get("nombre"),
+                "descripcion": plan.get("descripcion"),
+                "precio": precio_num,
+                "precio_formateado": formatear_precio_ars(precio_num),
+                "duracion_dias": duracion,
+                "duracion_texto": f"{duracion} días",
+                "limite_asistencias_semanales": plan.get("limite_asistencias_semanales"),
+                "limite_asistencias_totales": plan.get("limite_asistencias_totales"),
+                "estado": True,
+                "es_plan_actual": es_plan_actual,
+                "es_superior": (not es_plan_actual) and (precio_num > precio_actual),
+                "diferencia_precio": diferencia if diferencia > 0 else 0,
+                "diferencia_precio_formateada": formatear_precio_ars(diferencia) if diferencia > 0 else None,
+                "beneficios": sugerir_beneficios(plan.get("nombre")),
+            }
+        )
 
     return {
-        "gimnasio_id": socio.get("id_gimnasio"),
+        "id_gimnasio": gym_id,
         "plan_actual_id": plan_actual_id,
         "total_planes": len(planes_formateados),
         "planes": planes_formateados,
     }
 
 
-@router.post("/membresia/actualizar", status_code=status.HTTP_200_OK)
-async def solicitar_actualizacion(
-    req: ActualizarMembresiaSocio,
-    current_user: Dict[str, Any] = Depends(get_current_user)
+@router.post("/membresia/solicitar", status_code=status.HTTP_201_CREATED)
+@router.post("/membresia/actualizar", status_code=status.HTTP_201_CREATED)
+async def solicitar_contratacion_pendiente(
+    req: SolicitarMembresiaSocio,
+    current_user: Dict[str, Any] = Depends(get_current_user),
 ):
-    """Solicitar renovación o cambio de plan de membresía."""
-    socio = await obtener_socio_autenticado(current_user)
-    if not socio:
-        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Acceso no autorizado.")
-
-    plan_id = req.id_plan or req.plan_id
-    if not plan_id:
-        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Debes seleccionar un plan.")
+    """
+    Genera una solicitud de contratación en estado `'pendiente'` mediante `public.rpc_contratar_membresia`.
+    Nunca sobrescribe contratos anteriores ni activa membresías sin acreditación de pago.
+    """
+    socio_ctx = _resolve_socio_profile_context(current_user)
+    own_socio_id = int(socio_ctx["id_socio"])
+    db: Client = socio_ctx["supabase"]
 
     res_plan = (
-        supabase.from_("plan_membresia")
-        .select("*")
-        .eq("id_plan_membresia", plan_id)
+        db.from_("membresia_gimnasio")
+        .select(PLAN_COLUMNS)
+        .eq("id_membresia_gimnasio", req.id_membresia_gimnasio)
         .maybe_single()
         .execute()
     )
     plan = get_data(res_plan)
-    if not plan:
-        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="El plan seleccionado no existe.")
+    if not isinstance(plan, dict) or plan.get("estado") is not True:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="El plan seleccionado no existe o se encuentra inactivo.",
+        )
 
-    estado_plan = (plan.get("estado") or "").lower().strip()
-    if estado_plan in ("inactivo", "inactiva", "pausa", "pausado", "pausada", "cancelado", "cancelada", "eliminado", "eliminada"):
-        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Este plan de membresía se encuentra en pausa o inactivo en este momento.")
-
-    meses = req.meses or 1
-    duracion_dias = (plan.get("duracion_dias") or 30) * meses
-    hoy = date.today()
-
-    # Buscar membresía actual
-    res_m = (
-        supabase.from_("membresia")
-        .select("*")
-        .eq("id_socio", socio["id_socio"])
-        .order("fecha_vencimiento", desc=True)
-        .limit(1)
-        .maybe_single()
-        .execute()
+    plan_gym_id = int(plan["id_gimnasio"])
+    asocs = _fetch_socio_gimnasios_for_socio(db, own_socio_id)
+    assoc = next(
+        (a for a in asocs if int(a.get("id_gimnasio") or 0) == plan_gym_id and a.get("estado") is True),
+        None,
     )
-    memb_actual = get_data(res_m)
-
-    f_inicio = hoy
-    if memb_actual and memb_actual.get("fecha_vencimiento"):
-        fv = date.fromisoformat(str(memb_actual["fecha_vencimiento"]).split("T")[0])
-        if fv > hoy:
-            f_inicio = date.fromisoformat(str(memb_actual.get("fecha_inicio") or hoy).split("T")[0])
-            f_venc = fv + timedelta(days=duracion_dias)
-        else:
-            f_venc = hoy + timedelta(days=duracion_dias)
-    else:
-        f_venc = hoy + timedelta(days=duracion_dias)
-
-    precio_total = float(plan.get("precio", 0)) * meses
-
-    if memb_actual:
-        res_upd = (
-            supabase.from_("membresia")
-            .update({
-                "id_plan_membresia": plan_id,
-                "precio": precio_total,
-                "fecha_inicio": f_inicio.isoformat(),
-                "fecha_vencimiento": f_venc.isoformat(),
-                "estado": "activo",
-            })
-            .eq("id_membresia", memb_actual["id_membresia"])
-            .execute()
+    if not assoc:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="No posees una asociación activa en el gimnasio de este plan.",
         )
-        memb_resultado = res_upd.data[0]
-    else:
-        res_ins = (
-            supabase.from_("membresia")
-            .insert([{
-                "id_socio": socio["id_socio"],
-                "id_plan_membresia": plan_id,
-                "precio": precio_total,
-                "fecha_inicio": f_inicio.isoformat(),
-                "fecha_vencimiento": f_venc.isoformat(),
-                "estado": "activo",
-            }])
-            .execute()
-        )
-        memb_resultado = res_ins.data[0]
+
+    try:
+        res_rpc = db.rpc(
+            "rpc_contratar_membresia",
+            {
+                "p_id_socio": own_socio_id,
+                "p_id_membresia_gimnasio": req.id_membresia_gimnasio,
+                "p_fecha_inicio": req.fecha_inicio or date.today().isoformat(),
+                "p_estado": "pendiente",
+                "p_registrar_pago": False,
+                "p_metodo_pago": "efectivo",
+                "p_estado_pago": "pendiente",
+                "p_comprobante": None,
+                "p_monto_override": None,
+            },
+        ).execute()
+        resultado = get_data(res_rpc)
+    except Exception as exc:
+        raise HTTPException(
+            status_code=_map_rpc_error_status(exc),
+            detail=f"No fue posible registrar la solicitud de membresía: {exc}",
+        ) from exc
 
     return {
-        "mensaje": f"Membresía actualizada con éxito al plan {plan.get('nombre')}.",
-        "membresia": memb_resultado,
+        "mensaje": "Solicitud de membresía registrada en estado pendiente hasta la acreditación del pago.",
+        "membresia_socio": resultado.get("membresia_socio") if isinstance(resultado, dict) else resultado,
     }
 
-
-# ==============================================================================
-# INTEGRACIÓN DE PAGOS DIGITALES (MERCADO PAGO / UALÁ)
-# ==============================================================================
 
 @router.post("/pagos/iniciar", status_code=status.HTTP_200_OK)
 async def iniciar_pago(
     req: IniciarPagoSocio,
-    current_user: Dict[str, Any] = Depends(get_current_user)
+    current_user: Dict[str, Any] = Depends(get_current_user),
 ):
-    """Generar sesión de pago digital (Mercado Pago o Ualá)."""
-    socio = await obtener_socio_autenticado(current_user)
-    if not socio:
-        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Acceso no autorizado.")
-
-    plan_id = req.id_plan or req.plan_id
-    if not plan_id:
-        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Debes indicar un plan de membresía.")
+    """Prepara una sesión de pago digital (Mercado Pago / Ualá) usando exclusivamente el precio real del plan."""
+    socio_ctx = _resolve_socio_profile_context(current_user)
+    own_socio_id = int(socio_ctx["id_socio"])
+    db: Client = socio_ctx["supabase"]
 
     res_plan = (
-        supabase.from_("plan_membresia")
-        .select("*")
-        .eq("id_plan_membresia", plan_id)
+        db.from_("membresia_gimnasio")
+        .select(PLAN_COLUMNS)
+        .eq("id_membresia_gimnasio", req.id_membresia_gimnasio)
         .maybe_single()
         .execute()
     )
     plan = get_data(res_plan)
-    if not plan:
+    if not isinstance(plan, dict):
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Plan de membresía no encontrado.")
+    if plan.get("estado") is not True:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="El plan seleccionado está inactivo y no admite nuevos pagos.",
+        )
 
-    estado_plan = (plan.get("estado") or "").lower().strip()
-    if estado_plan in ("inactivo", "inactiva", "pausa", "pausado", "pausada", "cancelado", "cancelada", "eliminado", "eliminada"):
-        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="El plan de membresía seleccionado se encuentra pausado o inactivo y no admite nuevos pagos.")
+    plan_gym_id = int(plan["id_gimnasio"])
+    asocs = _fetch_socio_gimnasios_for_socio(db, own_socio_id)
+    assoc = next(
+        (a for a in asocs if int(a.get("id_gimnasio") or 0) == plan_gym_id and a.get("estado") is True),
+        None,
+    )
+    if not assoc:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="El plan seleccionado no pertenece a un gimnasio en el que tengas asociación activa.",
+        )
 
-    if socio.get("id_gimnasio") and plan.get("id_gimnasio") and plan["id_gimnasio"] != socio["id_gimnasio"]:
-        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="El plan de membresía no pertenece a tu gimnasio.")
-
-    # Gimnasio
-    res_gym = (
-        supabase.from_("gimnasio")
-        .select("nombre")
-        .eq("id_gimnasio", socio["id_gimnasio"])
+    res_socio = (
+        db.from_("socio")
+        .select("id_socio, nombre, apellido, dni, email, telefono")
+        .eq("id_socio", own_socio_id)
         .maybe_single()
         .execute()
     )
-    gym = get_data(res_gym)
+    socio = get_data(res_socio) or {"id_socio": own_socio_id}
+    gym = assoc.get("gimnasio") if isinstance(assoc.get("gimnasio"), dict) else {"id_gimnasio": plan_gym_id}
 
-    meses = req.meses or 1
-    monto_total = float(plan.get("precio", 0)) * meses
-    external_ref = f"GYM-{socio['id_gimnasio']}-SOC-{socio['id_socio']}-PL-{plan['id_plan_membresia']}-{int(time.time())}"
+    monto_real = round(float(plan.get("precio") or 0), 2)
+    external_ref = f"GYM-{plan_gym_id}-SOC-{own_socio_id}-PL-{req.id_membresia_gimnasio}-{int(time.time())}"
 
-    proveedor = (req.proveedor or "mercadopago").lower()
-    if proveedor == "uala":
+    if req.proveedor == "uala":
         orden = await crear_orden_uala(
             titulo=plan.get("nombre", "Plan GymTrack"),
-            monto=monto_total,
+            monto=monto_real,
             external_reference=external_ref,
             socio=socio,
             gimnasio=gym,
@@ -773,7 +605,7 @@ async def iniciar_pago(
     else:
         orden = await crear_preferencia_mercadopago(
             titulo=plan.get("nombre", "Plan GymTrack"),
-            monto=monto_total,
+            monto=monto_real,
             external_reference=external_ref,
             socio=socio,
             gimnasio=gym,
@@ -783,283 +615,4 @@ async def iniciar_pago(
         "orden": orden,
         "plan": plan,
         "socio": socio,
-    }
-
-
-@router.post("/pagos/confirmar", status_code=status.HTTP_200_OK)
-async def confirmar_pago(
-    req: ConfirmarPagoSocio,
-    current_user: Dict[str, Any] = Depends(get_current_user)
-):
-    """Confirmar acreditación de pago y actualizar vigencia de membresía."""
-    socio = await obtener_socio_autenticado(current_user)
-    if not socio:
-        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Acceso no autorizado.")
-
-    plan_id = req.id_plan or req.plan_id
-    plan = None
-    if plan_id:
-        res_p = (
-            supabase.from_("plan_membresia")
-            .select("*")
-            .eq("id_plan_membresia", plan_id)
-            .maybe_single()
-            .execute()
-        )
-        plan = get_data(res_p)
-
-    monto = float(req.monto) if req.monto is not None else (float(plan.get("precio", 0)) if plan else 0.0)
-    duracion_dias = int(plan.get("duracion_dias", 30)) if plan else 30
-    hoy = date.today()
-
-    # Membresía actual
-    res_m = (
-        supabase.from_("membresia")
-        .select("*")
-        .eq("id_socio", socio["id_socio"])
-        .order("fecha_vencimiento", desc=True)
-        .limit(1)
-        .maybe_single()
-        .execute()
-    )
-    memb_actual = get_data(res_m)
-
-    f_inicio = hoy
-    f_venc = hoy + timedelta(days=duracion_dias)
-
-    if memb_actual and memb_actual.get("fecha_vencimiento"):
-        fv = date.fromisoformat(str(memb_actual["fecha_vencimiento"]).split("T")[0])
-        if fv > hoy:
-            f_inicio = date.fromisoformat(str(memb_actual.get("fecha_inicio") or hoy).split("T")[0])
-            f_venc = fv + timedelta(days=duracion_dias)
-
-    id_memb_final = None
-    if memb_actual:
-        res_upd = (
-            supabase.from_("membresia")
-            .update({
-                "id_plan_membresia": plan_id or memb_actual.get("id_plan_membresia"),
-                "precio": monto,
-                "fecha_inicio": f_inicio.isoformat(),
-                "fecha_vencimiento": f_venc.isoformat(),
-                "estado": "activo",
-            })
-            .eq("id_membresia", memb_actual["id_membresia"])
-            .execute()
-        )
-        id_memb_final = memb_actual["id_membresia"]
-    else:
-        res_ins = (
-            supabase.from_("membresia")
-            .insert([{
-                "id_socio": socio["id_socio"],
-                "id_plan_membresia": plan_id,
-                "precio": monto,
-                "fecha_inicio": f_inicio.isoformat(),
-                "fecha_vencimiento": f_venc.isoformat(),
-                "estado": "activo",
-            }])
-            .execute()
-        )
-        if res_ins.data:
-            id_memb_final = res_ins.data[0]["id_membresia"]
-
-    comprobante_str = req.comprobante or req.id_pago_externo or f"PAG-{int(time.time())}"
-    res_pago = (
-        supabase.from_("pago")
-        .insert([{
-            "id_membresia": id_memb_final,
-            "monto": monto,
-            "fecha_pago": hoy.isoformat(),
-            "metodo_pago": (req.metodo_pago or req.proveedor or "digital").lower(),
-            "estado": "pagado",
-            "comprobante": comprobante_str,
-        }])
-        .execute()
-    )
-
-    # Actualizar estado del socio a activo
-    supabase.from_("socio").update({"estado": "activo"}).eq("id_socio", socio["id_socio"]).execute()
-
-    return {
-        "aprobado": True,
-        "mensaje": f"Pago acreditado exitosamente. Tu plan está activo hasta el {f_venc.isoformat()}.",
-        "pago": res_pago.data[0] if res_pago.data else None,
-    }
-
-
-@router.get("/pagos/verificar-mp", status_code=status.HTTP_200_OK)
-async def verificar_pago_mercadopago(
-    external_reference: Optional[str] = Query(None),
-    payment_id: Optional[str] = Query(None),
-    current_user: Dict[str, Any] = Depends(get_current_user)
-):
-    """Verificar estado del pago directamente en la API de Mercado Pago y acreditarlo automáticamente."""
-    socio = await obtener_socio_autenticado(current_user)
-    if not socio:
-        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Acceso no autorizado.")
-
-    if not MERCADOPAGO_ACCESS_TOKEN:
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail="No hay token de Mercado Pago configurado en las variables de entorno."
-        )
-
-    url_search = ""
-    if external_reference:
-        encoded_ref = urllib.parse.quote(external_reference)
-        url_search = f"https://api.mercadopago.com/v1/payments/search?external_reference={encoded_ref}"
-    elif payment_id:
-        url_search = f"https://api.mercadopago.com/v1/payments/{urllib.parse.quote(payment_id)}"
-    else:
-        url_search = "https://api.mercadopago.com/v1/payments/search?sort=date_created&criteria=desc&limit=10"
-
-    headers = {"Authorization": f"Bearer {MERCADOPAGO_ACCESS_TOKEN}"}
-
-    async with httpx.AsyncClient(timeout=15.0) as client:
-        mp_res = await client.get(url_search, headers=headers)
-        if mp_res.status_code != 200:
-            return {"aprobado": False, "mensaje": "No se encontró el pago en Mercado Pago."}
-
-        mp_data = mp_res.json()
-
-    pago_encontrado = None
-    results = mp_data.get("results")
-    if results and isinstance(results, list):
-        if external_reference:
-            pago_encontrado = next(
-                (p for p in results if p.get("external_reference") == external_reference and p.get("status") == "approved"),
-                results[0]
-            )
-        else:
-            pago_encontrado = next(
-                (p for p in results if p.get("status") == "approved" and f"-SOC-{socio['id_socio']}-" in str(p.get("external_reference") or "")),
-                None
-            )
-    elif mp_data.get("id") and mp_data.get("status") == "approved":
-        pago_encontrado = mp_data
-
-    if not pago_encontrado or pago_encontrado.get("status") != "approved":
-        return {
-            "aprobado": False,
-            "estado_mp": pago_encontrado.get("status") if pago_encontrado else "no_encontrado",
-            "mensaje": "Aún no se detecta la aprobación de Mercado Pago.",
-        }
-
-    mp_id = str(pago_encontrado.get("id"))
-    comprobante_str = f"MP-{mp_id}"
-
-    # Validar si ya está registrado
-    res_exist = (
-        supabase.from_("pago")
-        .select("id_pago, id_membresia")
-        .or_(f"comprobante.eq.{comprobante_str},comprobante.eq.{mp_id}")
-        .maybe_single()
-        .execute()
-    )
-    exist_data = get_data(res_exist)
-    if exist_data:
-        return {
-            "aprobado": True,
-            "ya_registrado": True,
-            "mensaje": "El pago ya se encuentra registrado y acreditado en GymTrack.",
-            "pago_id": exist_data["id_pago"],
-        }
-
-    # Extraer ID de plan
-    plan_id = None
-    ext_ref = pago_encontrado.get("external_reference") or ""
-    match = re.search(r"-PL-(\d+)-", ext_ref)
-    if match:
-        plan_id = int(match.group(1))
-
-    plan = None
-    if plan_id:
-        res_p = supabase.from_("plan_membresia").select("*").eq("id_plan_membresia", plan_id).maybe_single().execute()
-        plan = get_data(res_p)
-
-    monto_final = float(pago_encontrado.get("transaction_amount") or (plan.get("precio", 0) if plan else 0))
-    duracion_dias = int(plan.get("duracion_dias", 30)) if plan else 30
-    hoy = date.today()
-
-    # Membresía actual
-    res_m = (
-        supabase.from_("membresia")
-        .select("*")
-        .eq("id_socio", socio["id_socio"])
-        .order("fecha_vencimiento", desc=True)
-        .limit(1)
-        .maybe_single()
-        .execute()
-    )
-    memb_actual = get_data(res_m)
-
-    f_inicio = hoy
-    f_venc = hoy + timedelta(days=duracion_dias)
-
-    if memb_actual and memb_actual.get("fecha_vencimiento"):
-        fv = date.fromisoformat(str(memb_actual["fecha_vencimiento"]).split("T")[0])
-        if fv > hoy:
-            f_inicio = date.fromisoformat(str(memb_actual.get("fecha_inicio") or hoy).split("T")[0])
-            f_venc = fv + timedelta(days=duracion_dias)
-
-    id_memb_final = None
-    if memb_actual:
-        res_upd = (
-            supabase.from_("membresia")
-            .update({
-                "id_plan_membresia": plan.get("id_plan_membresia") if plan else memb_actual.get("id_plan_membresia"),
-                "precio": monto_final,
-                "fecha_inicio": f_inicio.isoformat(),
-                "fecha_vencimiento": f_venc.isoformat(),
-                "estado": "activo",
-            })
-            .eq("id_membresia", memb_actual["id_membresia"])
-            .execute()
-        )
-        id_memb_final = memb_actual["id_membresia"]
-    else:
-        res_ins = (
-            supabase.from_("membresia")
-            .insert([{
-                "id_socio": socio["id_socio"],
-                "id_plan_membresia": plan.get("id_plan_membresia") if plan else None,
-                "precio": monto_final,
-                "fecha_inicio": f_inicio.isoformat(),
-                "fecha_vencimiento": f_venc.isoformat(),
-                "estado": "activo",
-            }])
-            .execute()
-        )
-        if res_ins.data:
-            id_memb_final = res_ins.data[0]["id_membresia"]
-
-    res_pago = (
-        supabase.from_("pago")
-        .insert([{
-            "id_membresia": id_memb_final,
-            "monto": monto_final,
-            "fecha_pago": hoy.isoformat(),
-            "metodo_pago": "mercadopago",
-            "estado": "pagado",
-            "comprobante": comprobante_str,
-        }])
-        .execute()
-    )
-
-    supabase.from_("socio").update({"estado": "activo"}).eq("id_socio", socio["id_socio"]).execute()
-
-    return {
-        "aprobado": True,
-        "mensaje": f"¡Pago de {formatear_precio_ars(monto_final)} acreditado exitosamente! Tu plan ahora es {plan.get('nombre', 'Plan Activo') if plan else 'Plan Activo'}.",
-        "pago": res_pago.data[0] if res_pago.data else None,
-        "membresia": {
-            "id_membresia": id_memb_final,
-            "nombre_plan": plan.get("nombre", "Plan Activo") if plan else "Plan Activo",
-            "precio": monto_final,
-            "precio_formateado": formatear_precio_ars(monto_final),
-            "fecha_inicio": f_inicio.isoformat(),
-            "fecha_vencimiento": f_venc.isoformat(),
-            "estado": "activa",
-        },
     }

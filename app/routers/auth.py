@@ -1,372 +1,829 @@
 import re
-from datetime import datetime, timezone
 from typing import Dict, Any, Optional
+import httpx
 from fastapi import APIRouter, HTTPException, status, Depends
-from app.config import supabase
-from app.core.security import (
-    get_password_hash,
-    verify_password,
-    create_access_token,
+from supabase import Client
+
+from app.config import (
+    SUPABASE_URL,
+    SUPABASE_ANON_KEY,
+    supabase_anon,
+    create_supabase_client_for_token,
+    validate_supabase_configuration,
 )
-from app.core.dependencies import get_current_user
-from app.services.utils import get_data
+from app.core.dependencies import (
+    get_current_auth_user,
+    get_user_supabase_client,
+    get_current_user,
+    resolver_contexto_negocio,
+)
+from app.services.utils import (
+    get_data,
+    insert_gimnasio_with_rls,
+    map_postgrest_error,
+    raise_http_from_postgrest_error,
+)
 from app.models.auth import (
     RegisterOwnerRequest,
+    RegisterSocioRequest,
     LoginRequest,
     LoginSocioRequest,
+    RefreshTokenRequest,
+    VincularPerfilRequest,
     UpdateOwnerProfileRequest,
 )
 
 router = APIRouter(prefix="/api/auth", tags=["Autenticación"])
 
+EMAIL_REGEX = re.compile(r"^[^\s@]+@[^\s@]+\.[^\s@]+$")
+
+
+def _require_supabase_anon() -> Client:
+    if supabase_anon is None:
+        try:
+            validate_supabase_configuration()
+        except RuntimeError as exc:
+            raise HTTPException(
+                status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+                detail=str(exc),
+            ) from exc
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="El cliente público de Supabase Auth no está configurado en el servidor.",
+        )
+    return supabase_anon
+
+
+def _build_auth_identity_from_supabase_user(user_obj: Any, access_token: str) -> Dict[str, Any]:
+    """
+    Construye el diccionario de identidad Auth a partir de la respuesta oficial de Supabase Auth.
+    Nunca confía en `user_metadata` para email ni para el estado de verificación del correo.
+    """
+    uid = str(getattr(user_obj, "id", None) or (user_obj.get("id") if isinstance(user_obj, dict) else ""))
+    email = getattr(user_obj, "email", None) or (user_obj.get("email") if isinstance(user_obj, dict) else None)
+    email_confirmed_at = getattr(user_obj, "email_confirmed_at", None) or (
+        user_obj.get("email_confirmed_at") if isinstance(user_obj, dict) else None
+    )
+    app_meta = getattr(user_obj, "app_metadata", None) or (
+        user_obj.get("app_metadata") if isinstance(user_obj, dict) else {}
+    ) or {}
+    user_meta = getattr(user_obj, "user_metadata", None) or (
+        user_obj.get("user_metadata") if isinstance(user_obj, dict) else {}
+    ) or {}
+
+    return {
+        "auth_user_id": uid,
+        "sub": uid,
+        "email": str(email).strip().lower() if email else None,
+        "role": "authenticated",
+        "email_confirmed_at": email_confirmed_at,
+        "email_verified": bool(email_confirmed_at),
+        "app_metadata": app_meta,
+        "user_metadata": user_meta,
+        "access_token": access_token,
+    }
+
+
+def _try_auto_link_profile(db: Client, auth_identity: Dict[str, Any], perfil_tipo: str) -> bool:
+    """
+    Intenta vincular automáticamente un perfil preexistente sin auth_user_id durante un inicio
+    de sesión legítimo invocando `public.rpc_vincular_identidad_perfil(p_perfil_tipo)`.
+    Exige estrictamente en Python Y en PostgreSQL que el correo esté realmente verificado
+    (`email_confirmed_at IS NOT NULL` en `auth.users`).
+    """
+    if not auth_identity.get("email_verified") or not auth_identity.get("email_confirmed_at"):
+        return False
+    try:
+        res = db.rpc("rpc_vincular_identidad_perfil", {"p_perfil_tipo": perfil_tipo}).execute()
+        data = get_data(res)
+        return bool(isinstance(data, dict) and data.get("vinculado") is True)
+    except Exception:
+        return False
+
+
+async def _update_supabase_auth_user_with_token(
+    access_token: str,
+    payload: Dict[str, Any],
+) -> Dict[str, Any]:
+    """
+    Actualiza los atributos de cuenta (`password` o solicitud de cambio de `email`) del usuario
+    autenticado llamando directamente al endpoint oficial de Supabase Auth (`PUT /auth/v1/user`)
+    con el propio access token Bearer del usuario y la clave pública `SUPABASE_ANON_KEY`.
+    - Nunca utiliza `service_role`.
+    - No depende de una sesión local en `db.auth`.
+    - Respeta el flujo real de confirmación de cambio de correo configurado en Supabase Auth.
+    """
+    try:
+        validate_supabase_configuration()
+    except RuntimeError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=str(exc),
+        ) from exc
+
+    url = f"{SUPABASE_URL}/auth/v1/user"
+    headers = {
+        "Authorization": f"Bearer {access_token}",
+        "apikey": SUPABASE_ANON_KEY,
+        "Content-Type": "application/json",
+    }
+
+    try:
+        async with httpx.AsyncClient(timeout=15.0) as client:
+            resp = await client.put(url, headers=headers, json=payload)
+    except httpx.HTTPError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_502_BAD_GATEWAY,
+            detail=f"Error de comunicación con Supabase Auth al actualizar la cuenta: {exc}",
+        ) from exc
+
+    try:
+        body = resp.json() if resp.content else {}
+    except Exception:
+        body = {}
+
+    if resp.status_code in (401, 403):
+        msg = (
+            body.get("msg")
+            or body.get("message")
+            or body.get("error_description")
+            or "La sesión ha expirado o no es válida. Inicia sesión nuevamente."
+        )
+        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail=msg)
+
+    if resp.status_code >= 400:
+        msg = (
+            body.get("msg")
+            or body.get("message")
+            or body.get("error_description")
+            or f"Supabase Auth rechazó la actualización de cuenta (HTTP {resp.status_code})."
+        )
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=msg)
+
+    return body if isinstance(body, dict) else {}
+
 
 @router.post("/register", status_code=status.HTTP_201_CREATED)
 async def register_owner(req: RegisterOwnerRequest):
-    """Registro de gimnasio y dueño."""
+    """
+    Registro de dueño en Supabase Auth (`sign_up` público con verificación real de correo)
+    + `public.dueno` (y opcionalmente `public.gimnasio` y `public.sucursal` principal).
+    Nunca utiliza `service_role` ni auto-confirma correos (`email_confirm: True`).
+    """
+    anon_client = _require_supabase_anon()
     clean_email = str(req.email).strip().lower()
+    password_input = str(req.contrasena or req.password or "").strip()
 
-    # 1. Comprobar si el email ya existe
-    res_existente = (
-        supabase.from_("usuario")
-        .select("id_usuario")
-        .ilike("email", clean_email)
-        .maybe_single()
-        .execute()
-    )
-    if get_data(res_existente):
+    if len(password_input) < 6:
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
-            detail="El email ingresado ya está registrado."
+            detail="La contraseña debe tener al menos 6 caracteres.",
         )
 
-    # 2. Encriptar contraseña
-    contrasena_hash = get_password_hash(req.contrasena)
+    try:
+        signup_res = anon_client.auth.sign_up(
+            {
+                "email": clean_email,
+                "password": password_input,
+                "options": {
+                    "data": {
+                        "nombre": req.nombre.strip(),
+                        "apellido": req.apellido.strip(),
+                    }
+                },
+            }
+        )
+        auth_user = getattr(signup_res, "user", None)
+        session = getattr(signup_res, "session", None)
+    except Exception as exc:
+        msg = str(exc)
+        if "already" in msg.lower() or "registered" in msg.lower():
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail="El email ingresado ya está registrado.",
+            ) from exc
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=f"No se pudo registrar la cuenta en Supabase Auth: {msg}",
+        ) from exc
 
-    # 3. Insertar Usuario Dueño
-    now_iso = datetime.now(timezone.utc).isoformat()
-    nuevo_usuario_data = {
-        "nombre": req.nombre.strip(),
-        "apellido": req.apellido.strip(),
-        "email": clean_email,
-        "contrasena": contrasena_hash,
-        "rol": "dueño",
-        "estado": "activo",
-        "fecha_creacion": now_iso,
-    }
-    res_user = (
-        supabase.from_("usuario")
-        .insert([nuevo_usuario_data])
-        .execute()
-    )
-    if not res_user.data:
+    if not auth_user or not getattr(auth_user, "id", None):
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail="Error al registrar el usuario dueño."
+            detail="No se pudo inicializar el usuario en Supabase Auth.",
         )
-    nuevo_usuario = res_user.data[0]
-    id_usuario = nuevo_usuario["id_usuario"]
 
-    # 4. Insertar Gimnasio (si se especificó nombre)
+    access_token = getattr(session, "access_token", None) if session else None
+    refresh_token = getattr(session, "refresh_token", None) if session else None
+
+    # Si Supabase Auth requiere confirmación de email, NO crear ni vincular perfiles todavía
+    if not access_token:
+        return {
+            "requiere_confirmacion_email": True,
+            "mensaje": (
+                "Cuenta creada en Supabase Auth. Confirma tu correo electrónico antes de iniciar sesión."
+            ),
+        }
+
+    user_db = create_supabase_client_for_token(access_token)
+    auth_uid = str(auth_user.id)
+
+    try:
+        res_dueno = (
+            user_db.from_("dueno")
+            .insert(
+                [
+                    {
+                        "auth_user_id": auth_uid,
+                        "nombre": req.nombre.strip(),
+                        "apellido": req.apellido.strip(),
+                        "email": clean_email,
+                    }
+                ]
+            )
+            .execute()
+        )
+    except Exception as exc:
+        raise_http_from_postgrest_error(exc, "Error al crear el perfil de dueño")
+
+    dueno_rows = get_data(res_dueno) or []
+    if not dueno_rows:
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Error al registrar el perfil de dueño.",
+        )
+    nuevo_dueno = dueno_rows[0]
+
     nuevo_gimnasio = None
+    nueva_sucursal = None
     if req.nombreGimnasio and req.nombreGimnasio.strip():
-        gym_data = {
+        gym_payload = {
             "nombre": req.nombreGimnasio.strip(),
-            "direccion": req.direccion.strip() if req.direccion else None,
             "telefono": req.telefono.strip() if req.telefono else None,
             "email": req.emailGimnasio.strip().lower() if req.emailGimnasio else clean_email,
-            "fecha_registro": now_iso,
-            "estado": "activo",
-            "id_usuario": id_usuario,
+            "estado": True,
+            "id_dueno": nuevo_dueno["id_dueno"],
         }
-        res_gym = supabase.from_("gimnasio").insert([gym_data]).execute()
-        if res_gym.data:
-            nuevo_gimnasio = res_gym.data[0]
+        try:
+            nuevo_gimnasio = insert_gimnasio_with_rls(user_db, gym_payload)
+        except Exception as exc:
+            raise_http_from_postgrest_error(exc, "Error al crear el gimnasio inicial")
+        if nuevo_gimnasio:
+            if req.direccion and req.direccion.strip():
+                suc_payload = {
+                    "direccion": req.direccion.strip(),
+                    "telefono": req.telefono.strip() if req.telefono else None,
+                    "descripcion": "Sucursal principal",
+                    "estado": True,
+                    "id_gimnasio": nuevo_gimnasio["id_gimnasio"],
+                }
+                try:
+                    res_suc = user_db.from_("sucursal").insert([suc_payload]).execute()
+                except Exception as exc:
+                    raise_http_from_postgrest_error(exc, "Error al crear la sucursal principal")
+                suc_rows = get_data(res_suc) or []
+                if suc_rows:
+                    nueva_sucursal = suc_rows[0]
 
-    # 5. Generar token JWT
-    id_gimnasio = nuevo_gimnasio["id_gimnasio"] if nuevo_gimnasio else None
-    token_payload = {
-        "id_usuario": id_usuario,
-        "id_gimnasio": id_gimnasio,
-        "email": clean_email,
+    usuario_resp = {
+        **nuevo_dueno,
+        "id_dueno": nuevo_dueno["id_dueno"],
+        "id_gimnasio": nuevo_gimnasio["id_gimnasio"] if nuevo_gimnasio else None,
         "rol": "dueño",
+        "perfiles_disponibles": ["dueño"],
+        "gimnasio": nuevo_gimnasio,
+        "gimnasios": [nuevo_gimnasio] if nuevo_gimnasio else [],
     }
-    token = create_access_token(token_payload)
-
-    # Quitar contraseña del retorno
-    usuario_seguro = {k: v for k, v in nuevo_usuario.items() if k != "contrasena"}
-    usuario_seguro["gimnasio"] = nuevo_gimnasio
 
     mensaje = (
         "Dueño y Gimnasio registrados exitosamente."
         if nuevo_gimnasio
-        else "Usuario registrado exitosamente."
+        else "Cuenta de dueño registrada exitosamente."
     )
     return {
         "mensaje": mensaje,
-        "token": token,
-        "usuario": usuario_seguro,
+        "token": access_token,
+        "refresh_token": refresh_token,
+        "usuario": usuario_resp,
         "gimnasio": nuevo_gimnasio,
+        "sucursal": nueva_sucursal,
+    }
+
+
+@router.post("/register-socio", status_code=status.HTTP_201_CREATED)
+async def register_socio(req: RegisterSocioRequest):
+    """
+    Auto-registro de socio en Supabase Auth (`sign_up` público con verificación real de correo).
+    Seguridad anti-secuestro de fichas presenciales:
+    - Nunca utiliza `service_role` ni auto-confirma el correo (`email_confirm: True`).
+    - Nunca auto-vincula una ficha presencial preexistente durante el auto-registro:
+      la vinculación de fichas presenciales solo puede ocurrir después de confirmar el correo
+      mediante una sesión autenticada verificada (`POST /api/auth/vincular-perfil` o login verificado).
+    """
+    anon_client = _require_supabase_anon()
+    clean_email = str(req.email).strip().lower()
+    password_input = str(req.contrasena or req.password or "").strip()
+
+    if len(password_input) < 6:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="La contraseña debe tener al menos 6 caracteres.",
+        )
+
+    try:
+        signup_res = anon_client.auth.sign_up(
+            {
+                "email": clean_email,
+                "password": password_input,
+                "options": {
+                    "data": {
+                        "nombre": req.nombre.strip(),
+                        "apellido": req.apellido.strip(),
+                    }
+                },
+            }
+        )
+        auth_user = getattr(signup_res, "user", None)
+        session = getattr(signup_res, "session", None)
+    except Exception as exc:
+        msg = str(exc)
+        if "already" in msg.lower() or "registered" in msg.lower():
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail="El email ingresado ya está registrado.",
+            ) from exc
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=f"Error al registrar socio en Supabase Auth: {msg}",
+        ) from exc
+
+    access_token = getattr(session, "access_token", None) if session else None
+    refresh_token = getattr(session, "refresh_token", None) if session else None
+    email_confirmed_at = getattr(auth_user, "email_confirmed_at", None) if auth_user else None
+
+    # Exigir confirmación real del correo antes de emitir sesión de socio o permitir vincular ficha
+    if not access_token or not auth_user or not email_confirmed_at:
+        return {
+            "requiere_confirmacion_email": True,
+            "mensaje": (
+                "Cuenta creada en Supabase Auth. Confirma tu correo electrónico antes de iniciar sesión "
+                "o vincular una ficha presencial existente."
+            ),
+        }
+
+    user_db = create_supabase_client_for_token(access_token)
+    auth_uid = str(auth_user.id)
+
+    try:
+        res_socio = (
+            user_db.from_("socio")
+            .insert(
+                [
+                    {
+                        "auth_user_id": auth_uid,
+                        "nombre": req.nombre.strip(),
+                        "apellido": req.apellido.strip(),
+                        "email": clean_email,
+                        "dni": str(req.dni).strip() if req.dni else None,
+                        "telefono": str(req.telefono).strip() if req.telefono else None,
+                        "estado": True,
+                    }
+                ]
+            )
+            .execute()
+        )
+        rows = get_data(res_socio) or []
+        nuevo_socio = rows[0] if rows else None
+    except Exception as exc:
+        http_status, msg = map_postgrest_error(exc)
+        if http_status == status.HTTP_409_CONFLICT:
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail=(
+                    "Ya existe una ficha de socio registrada con ese correo o DNI. "
+                    "Inicia sesión con tu correo verificado y vincula tu perfil mediante /api/auth/vincular-perfil."
+                ),
+            ) from exc
+        raise HTTPException(
+            status_code=http_status,
+            detail=f"No se pudo crear el perfil de socio: {msg}",
+        ) from exc
+
+    socio_resp = {
+        **(nuevo_socio or {}),
+        "rol": "socio",
+        "perfiles_disponibles": ["socio"],
+        "gimnasio": None,
+        "gimnasios": [],
+        "id_gimnasio": None,
+    }
+    return {
+        "mensaje": "Cuenta de socio registrada exitosamente.",
+        "token": access_token,
+        "refresh_token": refresh_token,
+        "socio": socio_resp,
+        "usuario": socio_resp,
+        "gimnasios": [],
     }
 
 
 @router.post("/login", status_code=status.HTTP_200_OK)
 async def login(req: LoginRequest):
-    """Inicio de sesión general (Dueño / Administrador)."""
+    """
+    Inicio de sesión con Supabase Auth para personal organizacional y operativo
+    (Dueño, Administrador de Gimnasio o Empleado de Sucursal).
+    """
+    anon_client = _require_supabase_anon()
     password_input = req.contrasena or req.password
     if not req.email or not password_input:
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
-            detail="El correo electrónico y la contraseña son obligatorios."
+            detail="El correo electrónico y la contraseña son obligatorios.",
         )
 
     clean_email = req.email.strip().lower()
-
-    # 1. Buscar usuario
-    res = (
-        supabase.from_("usuario")
-        .select("id_usuario, nombre, apellido, email, contrasena, rol, estado, fecha_creacion")
-        .ilike("email", clean_email)
-        .maybe_single()
-        .execute()
-    )
-    usuario = get_data(res)
-
-    if not usuario:
+    if not EMAIL_REGEX.match(clean_email):
         raise HTTPException(
-            status_code=status.HTTP_401_UNAUTHORIZED,
-            detail="Credenciales inválidas. Verifica tu email y contraseña."
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="El formato del email ingresado no es válido.",
         )
 
-    if usuario.get("estado") != "activo":
+    try:
+        auth_res = anon_client.auth.sign_in_with_password(
+            {"email": clean_email, "password": password_input}
+        )
+        session = getattr(auth_res, "session", None)
+        user_obj = getattr(auth_res, "user", None)
+    except Exception as exc:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Credenciales inválidas. Verifica tu email y contraseña.",
+        ) from exc
+
+    if not session or not getattr(session, "access_token", None) or not user_obj:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Credenciales inválidas. Verifica tu email y contraseña.",
+        )
+
+    access_token = session.access_token
+    user_db = create_supabase_client_for_token(access_token)
+    auth_identity = _build_auth_identity_from_supabase_user(user_obj, access_token)
+
+    # Resolver contexto; solo intenta vincular ficha precreada si el correo está realmente verificado
+    try:
+        contexto = await resolver_contexto_negocio(user_db, auth_identity)
+    except HTTPException as exc:
+        if exc.status_code == status.HTTP_403_FORBIDDEN and auth_identity.get("email_verified"):
+            for candidate_tipo in ("dueno", "administrador", "empleado"):
+                _try_auto_link_profile(user_db, auth_identity, candidate_tipo)
+            contexto = await resolver_contexto_negocio(user_db, auth_identity)
+        else:
+            raise
+
+    has_staff_profile = any(
+        p in (contexto.get("perfiles_disponibles") or [])
+        for p in ("dueño", "administrador", "empleado")
+    )
+    if not has_staff_profile:
+        if "socio" in (contexto.get("perfiles_disponibles") or []):
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail="Esta cuenta corresponde a un Socio. Ingresa desde el Portal del Socio.",
+            )
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,
-            detail="Tu cuenta se encuentra inactiva o suspendida. Por favor, contacta al administrador."
+            detail="No se encontró un perfil de Dueño, Administrador o Empleado activo asociado a esta cuenta.",
         )
 
-    # 2. Validar contraseña
-    if not verify_password(password_input, usuario.get("contrasena")):
-        raise HTTPException(
-            status_code=status.HTTP_401_UNAUTHORIZED,
-            detail="Credenciales inválidas. Verifica tu email y contraseña."
-        )
-
-    # 3. Buscar gimnasio del usuario
-    res_gym = (
-        supabase.from_("gimnasio")
-        .select("id_gimnasio, nombre, direccion, telefono, estado")
-        .eq("id_usuario", usuario["id_usuario"])
-        .maybe_single()
-        .execute()
-    )
-    gimnasio = get_data(res_gym)
-
-    # 4. Generar token
-    token_payload = {
-        "id_usuario": usuario["id_usuario"],
-        "id_gimnasio": gimnasio["id_gimnasio"] if gimnasio else None,
-        "email": usuario["email"],
-        "rol": usuario["rol"],
-    }
-    token = create_access_token(token_payload)
+    rol_activo = contexto["rol"]
+    if rol_activo == "dueño":
+        perfil_base = contexto.get("dueno") or {}
+    elif rol_activo == "administrador":
+        perfil_base = contexto.get("administrador") or {}
+    else:
+        perfil_base = contexto.get("empleado") or {}
 
     usuario_seguro = {
-        "id_usuario": usuario["id_usuario"],
-        "nombre": usuario.get("nombre"),
-        "apellido": usuario.get("apellido"),
-        "email": usuario.get("email"),
-        "rol": usuario.get("rol"),
-        "estado": usuario.get("estado"),
-        "fecha_creacion": usuario.get("fecha_creacion"),
-        "gimnasio": gimnasio or None,
+        **perfil_base,
+        "auth_user_id": contexto["auth_user_id"],
+        "id_dueno": contexto.get("id_dueno"),
+        "id_administrador": contexto.get("id_administrador"),
+        "id_empleado": contexto.get("id_empleado"),
+        "rol": rol_activo,
+        "perfiles_disponibles": contexto.get("perfiles_disponibles"),
+        "roles_empleado": contexto.get("roles_empleado"),
+        "permisos": contexto.get("permisos"),
+        "sucursales_asignadas": contexto.get("sucursales_asignadas"),
+        "gimnasio": contexto.get("gimnasio"),
+        "gimnasios": contexto.get("gimnasios"),
+        "id_gimnasio": contexto.get("id_gimnasio"),
+        "id_sucursal": contexto.get("id_sucursal"),
     }
 
     return {
         "mensaje": "Inicio de sesión exitoso.",
-        "token": token,
+        "token": access_token,
+        "refresh_token": getattr(session, "refresh_token", None),
+        "expires_at": getattr(session, "expires_at", None),
         "usuario": usuario_seguro,
+        "gimnasio": contexto.get("gimnasio"),
+        "gimnasios": contexto.get("gimnasios"),
+        "sucursales_asignadas": contexto.get("sucursales_asignadas"),
     }
 
 
 @router.post("/login-socio", status_code=status.HTTP_200_OK)
 async def login_socio(req: LoginSocioRequest):
-    """Inicio de sesión exclusivo para Socios."""
+    """
+    Inicio de sesión en Supabase Auth para Socios (identidad única multi-gimnasio).
+    Solo vincula una ficha presencial preexistente si el correo electrónico está verificado en Supabase Auth.
+    """
+    anon_client = _require_supabase_anon()
     password_input = req.contrasena or req.password
-    if not req.email or not req.dni or not password_input:
+    if not req.email or not password_input:
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
-            detail="El correo electrónico, DNI y contraseña son obligatorios."
+            detail="El correo electrónico y la contraseña son obligatorios.",
         )
 
     clean_email = req.email.strip().lower()
-    clean_dni = str(req.dni).strip()
-    print(f"INFO:     [AUTH] Intento de login socio: email='{clean_email}', dni='{clean_dni}'")
-
-    # 1. Buscar al socio
-    res = (
-        supabase.from_("socio")
-        .select("id_socio, id_gimnasio, dni, telefono, fecha_alta, estado, nombre, apellido, email, contrasena")
-        .ilike("email", clean_email)
-        .eq("dni", clean_dni)
-        .maybe_single()
-        .execute()
-    )
-    socio = get_data(res)
-
-    if not socio:
-        print(f"WARNING:  [AUTH] Socio no encontrado con email='{clean_email}' y dni='{clean_dni}'")
+    if not EMAIL_REGEX.match(clean_email):
         raise HTTPException(
-            status_code=status.HTTP_401_UNAUTHORIZED,
-            detail="Credenciales inválidas. Verifique su correo electrónico y DNI."
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="El formato del email ingresado no es válido.",
         )
 
-    if (socio.get("estado") or "").lower() != "activo":
-        print(f"WARNING:  [AUTH] Socio '{clean_email}' inactivo (estado='{socio.get('estado')}')")
+    try:
+        auth_res = anon_client.auth.sign_in_with_password(
+            {"email": clean_email, "password": password_input}
+        )
+        session = getattr(auth_res, "session", None)
+        user_obj = getattr(auth_res, "user", None)
+    except Exception as exc:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Credenciales inválidas. Verifica tu correo electrónico y contraseña.",
+        ) from exc
+
+    if not session or not getattr(session, "access_token", None) or not user_obj:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Credenciales inválidas. Verifica tu correo electrónico y contraseña.",
+        )
+
+    access_token = session.access_token
+    user_db = create_supabase_client_for_token(access_token)
+    auth_identity = _build_auth_identity_from_supabase_user(user_obj, access_token)
+
+    try:
+        contexto = await resolver_contexto_negocio(user_db, auth_identity, requested_role="socio")
+    except HTTPException as exc:
+        if (
+            exc.status_code == status.HTTP_403_FORBIDDEN
+            and auth_identity.get("email_verified")
+            and _try_auto_link_profile(user_db, auth_identity, "socio")
+        ):
+            contexto = await resolver_contexto_negocio(user_db, auth_identity, requested_role="socio")
+        else:
+            raise
+
+    socio = contexto.get("socio")
+    if not socio:
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,
-            detail="El socio se encuentra inactivo. Comuníquese con la administración del gimnasio."
+            detail="No se encontró un perfil de socio vinculado a esta cuenta.",
         )
 
-    if not socio.get("contrasena"):
-        print(f"WARNING:  [AUTH] Socio '{clean_email}' sin contraseña asignada en la BD.")
-        raise HTTPException(
-            status_code=status.HTTP_401_UNAUTHORIZED,
-            detail="Este socio aún no tiene una contraseña asignada. Solicite su registro en el gimnasio."
-        )
-
-    # 2. Validar contraseña
-    if not verify_password(password_input, socio.get("contrasena")):
-        print(f"WARNING:  [AUTH] Contraseña incorrecta para socio '{clean_email}'")
-        raise HTTPException(
-            status_code=status.HTTP_401_UNAUTHORIZED,
-            detail="Credenciales inválidas. Contraseña incorrecta."
-        )
-
-    print(f"INFO:     [AUTH] Login exitoso para socio '{clean_email}' (id_socio={socio['id_socio']})")
-
-    # 3. Obtener datos del gimnasio
-    gimnasio = None
-    if socio.get("id_gimnasio"):
-        res_gym = (
-            supabase.from_("gimnasio")
-            .select("id_gimnasio, nombre, direccion, telefono, estado")
-            .eq("id_gimnasio", socio["id_gimnasio"])
-            .maybe_single()
-            .execute()
-        )
-        gimnasio = get_data(res_gym)
-
-    # 4. Generar token
-    token_payload = {
-        "id_socio": socio["id_socio"],
-        "id_gimnasio": socio.get("id_gimnasio"),
-        "dni": socio.get("dni"),
-        "email": socio.get("email"),
-        "rol": "socio",
-    }
-    token = create_access_token(token_payload)
+    if req.dni and str(req.dni).strip():
+        dni_input = re.sub(r"[\.\s-]", "", str(req.dni)).strip()
+        dni_socio = re.sub(r"[\.\s-]", "", str(socio.get("dni") or "")).strip()
+        if dni_socio and dni_input != dni_socio:
+            raise HTTPException(
+                status_code=status.HTTP_401_UNAUTHORIZED,
+                detail="El DNI ingresado no coincide con el registrado en tu cuenta.",
+            )
 
     socio_seguro = {
-        "id_socio": socio["id_socio"],
-        "id_gimnasio": socio.get("id_gimnasio"),
+        "id_socio": socio.get("id_socio"),
+        "auth_user_id": contexto["auth_user_id"],
+        "id_gimnasio": contexto.get("id_gimnasio"),
+        "id_socio_gimnasio": contexto.get("id_socio_gimnasio"),
         "nombre": socio.get("nombre"),
         "apellido": socio.get("apellido"),
         "dni": socio.get("dni"),
         "email": socio.get("email"),
         "telefono": socio.get("telefono"),
+        "fecha_alta": socio.get("fecha_alta"),
         "estado": socio.get("estado"),
         "rol": "socio",
-        "gimnasio": gimnasio,
+        "perfiles_disponibles": contexto.get("perfiles_disponibles"),
+        "gimnasio": contexto.get("gimnasio"),
+        "gimnasios": contexto.get("gimnasios"),
     }
 
     return {
         "mensaje": "Inicio de sesión exitoso.",
-        "token": token,
+        "token": access_token,
+        "refresh_token": getattr(session, "refresh_token", None),
+        "expires_at": getattr(session, "expires_at", None),
         "usuario": socio_seguro,
         "socio": socio_seguro,
+        "gimnasios": contexto.get("gimnasios"),
+    }
+
+
+@router.post("/refresh", status_code=status.HTTP_200_OK)
+async def refresh_session(req: RefreshTokenRequest):
+    """Renueva el access token de Supabase Auth utilizando un refresh_token válido."""
+    anon_client = _require_supabase_anon()
+    try:
+        res = anon_client.auth.refresh_session(req.refresh_token.strip())
+        session = getattr(res, "session", None)
+    except Exception as exc:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="No se pudo renovar la sesión. Inicia sesión nuevamente.",
+        ) from exc
+
+    if not session or not getattr(session, "access_token", None):
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="No se pudo renovar la sesión. Inicia sesión nuevamente.",
+        )
+
+    return {
+        "token": session.access_token,
+        "refresh_token": getattr(session, "refresh_token", None),
+        "expires_at": getattr(session, "expires_at", None),
+    }
+
+
+@router.post("/vincular-perfil", status_code=status.HTTP_200_OK)
+async def vincular_identidad_perfil(
+    req: VincularPerfilRequest,
+    auth_user: Dict[str, Any] = Depends(get_current_auth_user),
+    db: Client = Depends(get_user_supabase_client),
+):
+    """
+    Vincula la identidad de Supabase Auth autenticada (con correo realmente verificado) a un perfil
+    preexistente (`socio`, `administrador`, `empleado` o `dueno`) mediante la RPC oficial
+    `public.rpc_vincular_identidad_perfil`.
+    """
+    if not auth_user.get("email_verified"):
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Debes verificar tu correo electrónico en Supabase Auth antes de vincular un perfil preexistente.",
+        )
+
+    tipo_normalizado = "dueno" if req.perfil_tipo in ("dueno", "dueño") else req.perfil_tipo
+    try:
+        res = db.rpc("rpc_vincular_identidad_perfil", {"p_perfil_tipo": tipo_normalizado}).execute()
+        resultado = get_data(res)
+    except Exception as exc:
+        raise_http_from_postgrest_error(exc, f"No fue posible vincular el perfil '{tipo_normalizado}'")
+
+    return {
+        "mensaje": f"Perfil '{tipo_normalizado}' vinculado correctamente a tu cuenta.",
+        "resultado": resultado,
+        "auth_user_id": auth_user["auth_user_id"],
     }
 
 
 @router.get("/me", status_code=status.HTTP_200_OK)
-async def get_me(usuario_auth: Dict[str, Any] = Depends(get_current_user)):
-    """Obtener datos del usuario/socio actualmente autenticado."""
-    id_usuario = usuario_auth.get("id_usuario")
-    id_socio = usuario_auth.get("id_socio")
+async def get_me(current_user: Dict[str, Any] = Depends(get_current_user)):
+    """
+    Devuelve el perfil activo, todos los perfiles disponibles, gimnasios y sucursales
+    autorizadas del usuario autenticado consultando a través de su cliente RLS.
+    """
+    rol = current_user.get("rol")
+    db: Client = current_user["supabase"]
 
-    if not id_usuario and not id_socio:
-        raise HTTPException(
-            status_code=status.HTTP_401_UNAUTHORIZED,
-            detail="Usuario no autenticado."
-        )
-
-    # Caso Socio
-    if id_socio:
-        res_s = (
-            supabase.from_("socio")
-            .select("id_socio, id_gimnasio, dni, telefono, fecha_alta, estado, nombre, apellido, email")
-            .eq("id_socio", id_socio)
-            .maybe_single()
-            .execute()
-        )
-        socio = get_data(res_s)
-        if not socio:
-            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Socio no encontrado.")
-
-        gimnasio = None
-        if socio.get("id_gimnasio"):
-            res_g = (
-                supabase.from_("gimnasio")
-                .select("id_gimnasio, nombre, direccion, telefono, estado")
-                .eq("id_gimnasio", socio["id_gimnasio"])
-                .maybe_single()
+    if rol == "socio" and current_user.get("socio"):
+        socio = current_user["socio"]
+        try:
+            # Join real PostgREST respetando FKs compuestas:
+            # membresia_socio -> socio_gimnasio (FK compuesta) -> gimnasio (FK directa)
+            res_m = (
+                db.from_("membresia_socio")
+                .select(
+                    "id_membresia_socio, id_socio_gimnasio, id_gimnasio, id_membresia_gimnasio, "
+                    "precio, duracion_dias_contratados, limite_asistencias_semanales, "
+                    "limite_asistencias_totales, fecha_inicio, fecha_vencimiento, estado, "
+                    "socio_gimnasio!inner("
+                    "id_socio_gimnasio, id_socio, id_gimnasio, estado, "
+                    "gimnasio(id_gimnasio, nombre, telefono, email, estado)"
+                    "), "
+                    "membresia_gimnasio(id_membresia_gimnasio, nombre, descripcion)"
+                )
+                .eq("socio_gimnasio.id_socio", socio["id_socio"])
+                .order("fecha_vencimiento", desc=True)
                 .execute()
             )
-            gimnasio = get_data(res_g)
+            raw_membresias = get_data(res_m)
+        except Exception as exc:
+            raise_http_from_postgrest_error(exc, "Error al consultar las membresías del socio")
 
-        socio_resp = dict(socio)
-        socio_resp["rol"] = "socio"
-        socio_resp["gimnasio"] = gimnasio
-        return {"usuario": socio_resp}
+        membresias = raw_membresias if isinstance(raw_membresias, list) else []
 
-    # Caso Usuario / Dueño
-    res_u = (
-        supabase.from_("usuario")
-        .select("id_usuario, nombre, apellido, email, rol, estado, fecha_creacion")
-        .eq("id_usuario", id_usuario)
-        .maybe_single()
-        .execute()
-    )
-    usuario = get_data(res_u)
-    if not usuario:
-        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Usuario no encontrado.")
-
-    res_gym = (
-        supabase.from_("gimnasio")
-        .select("id_gimnasio, nombre, direccion, telefono, email, fecha_registro, estado, id_usuario")
-        .eq("id_usuario", usuario["id_usuario"])
-        .maybe_single()
-        .execute()
-    )
-    gym_data = get_data(res_gym)
-    estadisticas = None
-    if gym_data and gym_data.get("id_gimnasio"):
-        res_socios = (
-            supabase.from_("socio")
-            .select("id_socio, estado")
-            .eq("id_gimnasio", gym_data["id_gimnasio"])
-            .execute()
-        )
-        socios_gym = res_socios.data or []
-        total_socios = len(socios_gym)
-        socios_activos = sum(1 for s in socios_gym if (s.get("estado") or "").lower() == "activo")
-        estadisticas = {
-            "totalSocios": total_socios,
-            "sociosActivos": socios_activos,
+        socio_resp = {
+            **socio,
+            "rol": "socio",
+            "perfiles_disponibles": current_user.get("perfiles_disponibles"),
+            "id_gimnasio": current_user.get("id_gimnasio"),
+            "id_socio_gimnasio": current_user.get("id_socio_gimnasio"),
+            "gimnasio": current_user.get("gimnasio"),
+            "gimnasios": current_user.get("gimnasios"),
+        }
+        return {
+            "usuario": socio_resp,
+            "gimnasios": current_user.get("gimnasios"),
+            "membresias": membresias,
         }
 
-    user_resp = dict(usuario)
-    user_resp["gimnasio"] = gym_data
-    user_resp["estadisticas"] = estadisticas
-    return {"usuario": user_resp}
+    if rol == "empleado" and current_user.get("empleado"):
+        emp = current_user["empleado"]
+        emp_resp = {
+            **emp,
+            "rol": "empleado",
+            "perfiles_disponibles": current_user.get("perfiles_disponibles"),
+            "roles_empleado": current_user.get("roles_empleado"),
+            "permisos": current_user.get("permisos"),
+            "sucursales_asignadas": current_user.get("sucursales_asignadas"),
+            "id_gimnasio": current_user.get("id_gimnasio"),
+            "id_sucursal": current_user.get("id_sucursal"),
+            "gimnasio": current_user.get("gimnasio"),
+            "gimnasios": current_user.get("gimnasios"),
+        }
+        return {
+            "usuario": emp_resp,
+            "gimnasios": current_user.get("gimnasios"),
+            "sucursales_asignadas": current_user.get("sucursales_asignadas"),
+        }
+
+    if rol == "administrador" and current_user.get("administrador"):
+        admin = current_user["administrador"]
+        admin_resp = {
+            **admin,
+            "rol": "administrador",
+            "perfiles_disponibles": current_user.get("perfiles_disponibles"),
+            "permisos": current_user.get("permisos"),
+            "administrador_gimnasios": current_user.get("administrador_gimnasios"),
+            "id_gimnasio": current_user.get("id_gimnasio"),
+            "id_sucursal": current_user.get("id_sucursal"),
+            "gimnasio": current_user.get("gimnasio"),
+            "gimnasios": current_user.get("gimnasios"),
+            "sucursales": current_user.get("sucursales"),
+        }
+        return {
+            "usuario": admin_resp,
+            "gimnasios": current_user.get("gimnasios"),
+            "sucursales": current_user.get("sucursales"),
+        }
+
+    # Caso Dueño
+    dueno = current_user.get("dueno") or {}
+    estadisticas = None
+    active_gym_id = current_user.get("id_gimnasio")
+    if active_gym_id:
+        try:
+            res_sg = (
+                db.from_("socio_gimnasio")
+                .select("id_socio_gimnasio, id_socio, estado")
+                .eq("id_gimnasio", active_gym_id)
+                .execute()
+            )
+            sg_list = get_data(res_sg) or []
+            total_socios = len(sg_list)
+            socios_activos = sum(1 for s in sg_list if s.get("estado") is True)
+            sucs_gym = [
+                s for s in (current_user.get("sucursales") or [])
+                if s.get("id_gimnasio") == active_gym_id
+            ]
+            estadisticas = {
+                "totalSocios": total_socios,
+                "sociosActivos": socios_activos,
+                "totalSucursales": len(sucs_gym),
+                "sucursalesActivas": sum(1 for s in sucs_gym if s.get("estado") is not False),
+            }
+        except Exception as exc:
+            raise_http_from_postgrest_error(exc, "Error al consultar estadísticas del gimnasio")
+
+    dueno_resp = {
+        **dueno,
+        "rol": "dueño",
+        "perfiles_disponibles": current_user.get("perfiles_disponibles"),
+        "permisos": current_user.get("permisos"),
+        "id_gimnasio": active_gym_id,
+        "gimnasio": current_user.get("gimnasio"),
+        "gimnasios": current_user.get("gimnasios"),
+        "sucursales": current_user.get("sucursales"),
+        "estadisticas": estadisticas,
+    }
+    return {
+        "usuario": dueno_resp,
+        "gimnasios": current_user.get("gimnasios"),
+    }
 
 
 @router.put("/me", status_code=status.HTTP_200_OK)
@@ -375,100 +832,178 @@ async def update_owner_profile(
     req: UpdateOwnerProfileRequest,
     current_user: Dict[str, Any] = Depends(get_current_user),
 ):
-    """Permite al dueño actualizar sus datos personales (nombre, apellido, email) y cambiar su contraseña."""
-    id_usuario = current_user.get("id_usuario")
-    if not id_usuario:
+    """
+    Actualiza los datos personales del perfil activo en su tabla definitiva
+    (`public.dueno`, `public.administrador`, `public.empleado` o `public.socio`)
+    respetando RLS, y gestiona cambios de contraseña o solicitudes de cambio de correo
+    exclusivamente mediante el access token del usuario autenticado (`PUT /auth/v1/user`),
+    sin usar `service_role` ni depender de una sesión GoTrue local.
+    """
+    rol = current_user.get("rol")
+    db: Client = current_user["supabase"]
+    access_token: str = str(current_user.get("access_token") or "").strip()
+
+    table_map = {
+        "dueño": ("dueno", "id_dueno", current_user.get("id_dueno"), current_user.get("dueno") or {}),
+        "administrador": (
+            "administrador",
+            "id_administrador",
+            current_user.get("id_administrador"),
+            current_user.get("administrador") or {},
+        ),
+        "empleado": ("empleado", "id_empleado", current_user.get("id_empleado"), current_user.get("empleado") or {}),
+        "socio": ("socio", "id_socio", current_user.get("id_socio"), current_user.get("socio") or {}),
+    }
+
+    if rol not in table_map or not table_map[rol][2]:
         raise HTTPException(
-            status_code=status.HTTP_401_UNAUTHORIZED,
-            detail="Usuario no autenticado o no autorizado como administrador.",
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="No se encontró un perfil activo autorizado para actualizar.",
         )
 
-    res_curr = (
-        supabase.from_("usuario")
-        .select("*")
-        .eq("id_usuario", id_usuario)
-        .maybe_single()
-        .execute()
-    )
-    usuario_actual = get_data(res_curr)
-    if not usuario_actual:
-        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Usuario no encontrado.")
+    table_name, pk_col, pk_val, current_profile = table_map[rol]
+    update_fields: Dict[str, Any] = {}
 
-    update_fields = {}
     if req.nombre is not None:
         if not req.nombre.strip():
             raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="El nombre es obligatorio.")
         update_fields["nombre"] = req.nombre.strip()
 
     if req.apellido is not None:
+        if not req.apellido.strip():
+            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="El apellido es obligatorio.")
         update_fields["apellido"] = req.apellido.strip()
 
+    if req.telefono is not None and table_name in ("administrador", "empleado", "socio"):
+        update_fields["telefono"] = req.telefono.strip() if req.telefono.strip() else None
+
+    if req.dni is not None and table_name in ("administrador", "empleado", "socio"):
+        update_fields["dni"] = req.dni.strip() if req.dni.strip() else None
+
+    email_cambio: Optional[str] = None
     if req.email is not None:
         clean_email = req.email.strip().lower()
-        if not re.match(r"^[^\s@]+@[^\s@]+\.[^\s@]+$", clean_email):
+        if not EMAIL_REGEX.match(clean_email):
             raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="El formato del email no es válido.")
+        current_email = str(current_profile.get("email") or current_user.get("email") or "").lower()
+        if clean_email != current_email:
+            email_cambio = clean_email
 
-        if clean_email != (usuario_actual.get("email") or "").lower():
-            res_ex = (
-                supabase.from_("usuario")
-                .select("id_usuario")
-                .ilike("email", clean_email)
-                .neq("id_usuario", id_usuario)
-                .maybe_single()
-                .execute()
-            )
-            if get_data(res_ex):
-                raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="El email ingresado ya está en uso por otra cuenta.")
-            update_fields["email"] = clean_email
+    nuevo_token: Optional[str] = None
+    nuevo_refresh_token: Optional[str] = None
+    cambio_email_pendiente: bool = False
 
     if req.nueva_contrasena and req.nueva_contrasena.strip():
         pass_limpia = req.nueva_contrasena.strip()
         if len(pass_limpia) < 6:
-            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="La nueva contraseña debe tener al menos 6 caracteres.")
-
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="La nueva contraseña debe tener al menos 6 caracteres.",
+            )
         if not req.contrasena_actual:
-            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Debes ingresar tu contraseña actual para confirmar el cambio.")
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="Debes ingresar tu contraseña actual para confirmar el cambio.",
+            )
+        if not access_token:
+            raise HTTPException(
+                status_code=status.HTTP_401_UNAUTHORIZED,
+                detail="Sesión inválida o expirada. Inicia sesión nuevamente.",
+            )
 
-        if not verify_password(req.contrasena_actual, usuario_actual.get("contrasena") or ""):
-            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="La contraseña actual ingresada es incorrecta.")
+        anon_client = _require_supabase_anon()
+        user_email = current_user.get("email") or current_profile.get("email")
+        try:
+            anon_client.auth.sign_in_with_password(
+                {"email": user_email, "password": req.contrasena_actual}
+            )
+        except Exception as exc:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="La contraseña actual ingresada es incorrecta.",
+            ) from exc
 
-        update_fields["contrasena"] = get_password_hash(pass_limpia)
+        # Actualizar contraseña vía endpoint oficial de Supabase Auth con el propio Bearer token del usuario
+        await _update_supabase_auth_user_with_token(access_token, {"password": pass_limpia})
 
-    if not update_fields:
-        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="No se enviaron datos para actualizar.")
+        try:
+            re_auth = anon_client.auth.sign_in_with_password(
+                {"email": user_email, "password": pass_limpia}
+            )
+            re_session = getattr(re_auth, "session", None)
+            if re_session:
+                nuevo_token = getattr(re_session, "access_token", None)
+                nuevo_refresh_token = getattr(re_session, "refresh_token", None)
+        except Exception:
+            pass
 
-    res_upd = (
-        supabase.from_("usuario")
-        .update(update_fields)
-        .eq("id_usuario", id_usuario)
-        .execute()
-    )
-    if not res_upd.data:
-        raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail="Error al actualizar el usuario.")
+    if email_cambio:
+        if not access_token:
+            raise HTTPException(
+                status_code=status.HTTP_401_UNAUTHORIZED,
+                detail="Sesión inválida o expirada. Inicia sesión nuevamente.",
+            )
+        # Solicitar cambio de correo a Supabase Auth respetando confirmación real (jamás email_confirm=True)
+        auth_upd = await _update_supabase_auth_user_with_token(
+            nuevo_token or access_token,
+            {"email": email_cambio},
+        )
+        new_email_pending = str(auth_upd.get("new_email") or "").strip().lower()
+        confirmed_email_now = str(auth_upd.get("email") or "").strip().lower()
+        if confirmed_email_now == email_cambio and not new_email_pending:
+            update_fields["email"] = email_cambio
+        else:
+            cambio_email_pendiente = True
 
-    updated_user = res_upd.data[0]
-    updated_user = {k: v for k, v in updated_user.items() if k != "contrasena"}
+    if not update_fields and not nuevo_token and not cambio_email_pendiente and not (req.nueva_contrasena and req.nueva_contrasena.strip()):
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="No se enviaron datos para actualizar.",
+        )
 
-    res_gym = (
-        supabase.from_("gimnasio")
-        .select("*")
-        .eq("id_usuario", id_usuario)
-        .maybe_single()
-        .execute()
-    )
-    gym = get_data(res_gym)
-    updated_user["gimnasio"] = gym or None
+    updated_profile = dict(current_profile)
+    if update_fields:
+        try:
+            res_upd = (
+                db.from_(table_name)
+                .update(update_fields)
+                .eq(pk_col, pk_val)
+                .execute()
+            )
+        except Exception as exc:
+            raise_http_from_postgrest_error(exc, "Error al actualizar los datos del perfil")
+        rows = get_data(res_upd) or []
+        if not rows:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail="Perfil no encontrado o sin permisos para actualizar.",
+            )
+        updated_profile = rows[0]
 
-    token_payload = {
-        "id_usuario": updated_user["id_usuario"],
-        "id_gimnasio": gym.get("id_gimnasio") if gym else current_user.get("id_gimnasio"),
-        "email": updated_user["email"],
-        "rol": updated_user["rol"],
+    resp_user = {
+        **updated_profile,
+        "rol": rol,
+        "id_gimnasio": current_user.get("id_gimnasio"),
+        "gimnasio": current_user.get("gimnasio"),
+        "gimnasios": current_user.get("gimnasios"),
     }
-    token = create_access_token(token_payload)
 
-    return {
-        "mensaje": "Perfil actualizado exitosamente.",
-        "usuario": updated_user,
-        "token": token,
+    mensaje = "Perfil actualizado exitosamente."
+    if cambio_email_pendiente:
+        mensaje = (
+            "Solicitud de cambio de correo enviada. Confirma el nuevo correo electrónico "
+            "desde el enlace enviado por Supabase Auth para completar el cambio."
+        )
+
+    response_payload: Dict[str, Any] = {
+        "mensaje": mensaje,
+        "usuario": resp_user,
     }
+    if cambio_email_pendiente:
+        response_payload["cambio_email_pendiente_confirmacion"] = True
+        response_payload["email_pendiente"] = email_cambio
+    if nuevo_token:
+        response_payload["token"] = nuevo_token
+        response_payload["refresh_token"] = nuevo_refresh_token
+
+    return response_payload

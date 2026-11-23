@@ -2,19 +2,24 @@
 # SERVIDOR PRINCIPAL DE GYMTRACK (FASTAPI + PYTHON)
 # ==============================================================================
 
-
+from contextlib import asynccontextmanager
 from datetime import datetime, timezone
 import uvicorn
-from fastapi import FastAPI, status, Response, Request
+from fastapi import FastAPI, status, Request
 from fastapi.exceptions import RequestValidationError
 from starlette.exceptions import HTTPException as StarletteHTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
+from postgrest.exceptions import APIError
 
-from app.config import PORT, HOST, supabase
+from app.config import PORT, HOST, supabase, validate_supabase_configuration
+from app.services.utils import map_postgrest_error
 from app.routers import (
     auth,
     gimnasios,
+    sucursales,
+    administradores,
+    empleados,
     socios,
     planes_membresia,
     membresias,
@@ -27,6 +32,14 @@ from app.routers import (
     socio_ejercicios,
 )
 
+
+@asynccontextmanager
+async def lifespan(_app: FastAPI):
+    # Al iniciar el servidor, detener la inicialización si se configuró una clave secreta en variables públicas
+    validate_supabase_configuration()
+    yield
+
+
 # 1. INICIALIZACIÓN DE LA APLICACIÓN FASTAPI
 app = FastAPI(
     title="GymTrack API",
@@ -34,6 +47,7 @@ app = FastAPI(
     description="API REST Backend en Python (FastAPI) para el sistema de gestión de gimnasios GymTrack.",
     docs_url="/docs",
     redoc_url="/redoc",
+    lifespan=lifespan,
 )
 
 # 2. MIDDLEWARES GLOBALES (CORS)
@@ -59,13 +73,27 @@ async def custom_http_exception_handler(request: Request, exc: StarletteHTTPExce
     )
 
 
+@app.exception_handler(APIError)
+async def postgrest_api_error_handler(request: Request, exc: APIError):
+    """Manejador centralizado de errores PostgREST / PostgreSQL (`23505`, `42501`, `23503`, `23514`, `P0001`, `PGRST200`)."""
+    http_status, msg = map_postgrest_error(exc)
+    return JSONResponse(
+        status_code=http_status,
+        content={
+            "detail": msg,
+            "error": msg,
+            "code": getattr(exc, "code", None),
+        },
+    )
+
+
 @app.exception_handler(RequestValidationError)
 async def validation_exception_handler(request: Request, exc: RequestValidationError):
     first_msg = "Error de validación en la solicitud."
     if exc.errors():
         first_msg = exc.errors()[0].get("msg", first_msg)
     return JSONResponse(
-        status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+        status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
         content={
             "detail": exc.errors(),
             "error": first_msg,
@@ -73,6 +101,7 @@ async def validation_exception_handler(request: Request, exc: RequestValidationE
     )
 
 # 3. RUTAS DE PRUEBA Y SALUD
+
 
 @app.get("/", tags=["General"])
 async def root():
@@ -82,13 +111,13 @@ async def root():
 
 @app.get("/api/health", tags=["General"])
 async def health_check():
-    """Endpoint para verificar el estado del servidor y la conexión a Supabase."""
+    """Endpoint para verificar el estado del servidor y la configuración pública de Supabase."""
     try:
+        validate_supabase_configuration()
         if not supabase:
-            raise Exception("Cliente de Supabase no configurado.")
+            raise RuntimeError("Cliente público de Supabase no configurado.")
 
-        # Llamada ligera a Supabase para certificar credenciales y comunicación
-        session = supabase.auth.get_session()
+        supabase.auth.get_session()
 
         return {
             "status": "ok",
@@ -109,6 +138,9 @@ async def health_check():
 # 4. REGISTRAR LAS RUTAS DE LA API
 app.include_router(auth.router)
 app.include_router(gimnasios.router)
+app.include_router(sucursales.router)
+app.include_router(administradores.router)
+app.include_router(empleados.router)
 app.include_router(socios.router)
 app.include_router(planes_membresia.router)
 app.include_router(membresias.router)
