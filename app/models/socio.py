@@ -40,10 +40,12 @@ class SocioCreate(BaseModel):
     dni: Optional[Any] = None
     telefono: Optional[str] = Field(default=None, max_length=30)
     email: Optional[str] = Field(default=None, max_length=254)
-    # Campos protegidos/obsoletos detectados explícitamente para bloqueo controlado
+    # Campos de aprovisionamiento seguro (contraseña inicial vía Supabase Auth, nunca en public.socio)
     auth_user_id: Optional[Any] = None
-    contrasena: Optional[Any] = None
-    password: Optional[Any] = None
+    contrasena_inicial: Optional[str] = None
+    contrasena: Optional[str] = None
+    password: Optional[str] = None
+    confirmar_incorporacion: bool = False
 
     @field_validator("email")
     @classmethod

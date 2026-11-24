@@ -8,6 +8,11 @@ from app.core.dependencies import (
     _switch_profile_context_if_available,
 )
 from app.services.utils import get_data, raise_http_from_postgrest_error
+from app.services.account_provisioning import (
+    detectar_identidad_para_incorporacion,
+    validate_initial_password_policy,
+    aprovisionar_o_vincular_cuenta_auth,
+)
 from app.models.empleado import (
     RegistrarEmpleadoSucursalRequest,
     AsignacionEmpleadoSucursalCreate,
@@ -263,10 +268,12 @@ async def registrar_empleado_sucursal_logic(
     clean_dni = req.dni.strip() if req.dni and req.dni.strip() else None
     clean_email = str(req.email).strip().lower() if req.email else None
     target_emp_id = int(req.id_empleado) if req.id_empleado is not None else None
+    raw_password = req.contrasena_inicial or req.contrasena or req.password
 
     # Comprobar si el empleado ya existe para:
     # 1. Impedir que un empleado desactivado (empleado.estado = False) reciba nuevas asignaciones.
     # 2. Prevenir asociaciones activas duplicadas en la misma sucursal.
+    # 3. Proteger credenciales globales: jamás sobrescribir contraseña de cuenta existente.
     existing_emp: Optional[Dict[str, Any]] = None
     if target_emp_id is not None:
         res_e = db.from_("empleado").select(EMPLEADO_COLUMNS).eq("id_empleado", target_emp_id).maybe_single().execute()
@@ -306,6 +313,46 @@ async def registrar_empleado_sucursal_logic(
                 detail="El empleado ya posee una asignación activa en esta sucursal.",
             )
 
+    detection: Dict[str, Any] = {}
+    if clean_dni or clean_email:
+        detection = detectar_identidad_para_incorporacion(
+            db=db,
+            actor_auth_user_id=manager_ctx.get("auth_user_id"),
+            tipo_perfil="empleado",
+            gym_id=int(sucursal["id_gimnasio"]),
+            sucursal_id=int(target_sucursal_id),
+            dni=clean_dni,
+            email=clean_email,
+            skip_rate_limit=True,
+        )
+        if detection.get("conflicto_identidad"):
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail=detection["mensaje"],
+            )
+        if detection.get("ya_asignado_en_esta_sucursal"):
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail="El empleado ya posee una asignación activa en esta sucursal.",
+            )
+        if detection.get("_internal_perfil_estado") is False:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="No se puede asignar a una sucursal un empleado cuya identidad se encuentra desactivada.",
+            )
+
+    tiene_auth_previa = bool(
+        (existing_emp and existing_emp.get("auth_user_id"))
+        or detection.get("tiene_cuenta_auth")
+    )
+    perfil_previo = bool(existing_emp is not None or detection.get("existe_perfil_mismo_tipo"))
+    validated_password = validate_initial_password_policy(
+        password_inicial=raw_password,
+        email=clean_email,
+        tiene_cuenta_auth_existente=tiene_auth_previa,
+        perfil_ya_existia=perfil_previo,
+    )
+
     rpc_params = {
         "p_id_sucursal": int(target_sucursal_id),
         "p_rol": req.rol.strip().lower(),
@@ -332,7 +379,32 @@ async def registrar_empleado_sucursal_logic(
     creado = bool(resultado.get("creado"))
     empleado_data = resultado.get("empleado")
     if isinstance(empleado_data, dict):
-        empleado_data = {k: v for k, v in empleado_data.items() if k != "id_gimnasio"}
+        empleado_data = {
+            k: v
+            for k, v in empleado_data.items()
+            if k not in ("id_gimnasio", "contrasena", "password")
+        }
+
+    auth_info = {"cuenta_auth_creada": False, "cuenta_auth_reutilizada": False, "requiere_confirmacion_email": False}
+    if isinstance(empleado_data, dict) and empleado_data.get("id_empleado"):
+        if not creado and validated_password:
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail=(
+                    "Esta persona ya tiene un registro en GymTrack. "
+                    "No está permitido modificar su contraseña al incorporarla."
+                ),
+            )
+        auth_info = aprovisionar_o_vincular_cuenta_auth(
+            tipo_perfil="empleado",
+            pk_val=int(empleado_data["id_empleado"]),
+            email=empleado_data.get("email") or clean_email,
+            nombre=empleado_data.get("nombre") or req.nombre,
+            apellido=empleado_data.get("apellido") or req.apellido,
+            password_inicial=validated_password if creado else None,
+            existing_profile_auth_uid=empleado_data.get("auth_user_id"),
+            existing_global_auth_uid=detection.get("_internal_global_auth_uid"),
+        )
 
     return {
         "mensaje": (
@@ -344,6 +416,7 @@ async def registrar_empleado_sucursal_logic(
         "id_gimnasio": sucursal.get("id_gimnasio"),
         "empleado": empleado_data,
         "empleado_sucursal": resultado.get("empleado_sucursal"),
+        **auth_info,
     }
 
 

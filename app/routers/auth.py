@@ -1,5 +1,5 @@
 import re
-from typing import Dict, Any, Optional
+from typing import Dict, Any, Optional, List
 import httpx
 from fastapi import APIRouter, HTTPException, status, Depends
 from supabase import Client
@@ -16,6 +16,11 @@ from app.core.dependencies import (
     get_user_supabase_client,
     get_current_user,
     resolver_contexto_negocio,
+    invalidate_user_context_cache,
+)
+from app.services.account_provisioning import (
+    detectar_identidad_para_incorporacion,
+    sanitize_detection_response,
 )
 from app.services.utils import (
     get_data,
@@ -31,6 +36,9 @@ from app.models.auth import (
     RefreshTokenRequest,
     VincularPerfilRequest,
     UpdateOwnerProfileRequest,
+    CambiarContrasenaRequest,
+    RecuperarContrasenaRequest,
+    VerificarIdentidadRequest,
 )
 
 router = APIRouter(prefix="/api/auth", tags=["Autenticación"])
@@ -427,11 +435,134 @@ async def register_socio(req: RegisterSocioRequest):
     }
 
 
-@router.post("/login", status_code=status.HTTP_200_OK)
-async def login(req: LoginRequest):
+_ETIQUETAS_SUBROL_EMPLEADO = {
+    "administrador": "Administrador de Sucursal",
+    "recepcionista": "Recepcionista",
+    "entrenador": "Entrenador",
+}
+
+_ETIQUETAS_ROL_PRINCIPAL = {
+    "dueño": "Dueño",
+    "administrador": "Administrador",
+    "empleado": "Empleado",
+    "socio": "Socio",
+}
+
+
+def _build_contextos_disponibles(
+    contexto: Dict[str, Any],
+    rol_override: Optional[str] = None,
+) -> List[Dict[str, Any]]:
     """
-    Inicio de sesión con Supabase Auth para personal organizacional y operativo
-    (Dueño, Administrador de Gimnasio o Empleado de Sucursal).
+    Construye la lista autorizada de contextos (gimnasio y sucursal cuando corresponda)
+    disponibles para que el usuario seleccione al iniciar sesión.
+    """
+    rol_target = rol_override or contexto.get("rol")
+    if not rol_target:
+        return []
+
+    ctx_por_perfil = contexto.get("contexto_por_perfil") or {}
+    perfil_ctx = ctx_por_perfil.get(rol_target) or {}
+    gyms_list = perfil_ctx.get("gimnasios") if perfil_ctx else (contexto.get("gimnasios") or [])
+    if not isinstance(gyms_list, list):
+        gyms_list = []
+
+    if rol_target == "empleado":
+        sucs_list = perfil_ctx.get("sucursales") if perfil_ctx else (contexto.get("sucursales_asignadas") or [])
+        gyms_by_id = {
+            int(g["id_gimnasio"]): g
+            for g in gyms_list
+            if isinstance(g, dict) and g.get("id_gimnasio") is not None
+        }
+        items: List[Dict[str, Any]] = []
+        seen: set = set()
+        for s in (sucs_list if isinstance(sucs_list, list) else []):
+            if not isinstance(s, dict):
+                continue
+            if s.get("estado") is False or s.get("estado_sucursal") is False:
+                continue
+            sid = s.get("id_sucursal")
+            gid = s.get("id_gimnasio")
+            if sid is None or gid is None:
+                continue
+            key = (int(gid), int(sid))
+            if key in seen:
+                continue
+            seen.add(key)
+            gym_obj = gyms_by_id.get(int(gid)) or {}
+            subrol = str(s.get("rol") or "").strip().lower()
+            items.append(
+                {
+                    "contexto_id": f"empleado:{int(gid)}:{int(sid)}",
+                    "rol": "empleado",
+                    "etiqueta_rol": _ETIQUETAS_SUBROL_EMPLEADO.get(subrol, "Empleado"),
+                    "subrol_empleado": subrol or None,
+                    "id_gimnasio": int(gid),
+                    "nombre_gimnasio": gym_obj.get("nombre") or f"Gimnasio #{int(gid)}",
+                    "estado_gimnasio": gym_obj.get("estado", True),
+                    "id_sucursal": int(sid),
+                    "nombre_sucursal": s.get("descripcion") or s.get("direccion") or f"Sucursal #{int(sid)}",
+                    "direccion_sucursal": s.get("direccion"),
+                }
+            )
+        return items
+
+    etiqueta = _ETIQUETAS_ROL_PRINCIPAL.get(rol_target, str(rol_target).capitalize())
+    activos = [
+        g for g in gyms_list
+        if isinstance(g, dict)
+        and g.get("id_gimnasio") is not None
+        and g.get("estado_asociacion") is not False
+        and g.get("estado_asignacion") is not False
+        and (rol_target == "dueño" or g.get("estado") is not False)
+    ]
+    items_gym: List[Dict[str, Any]] = []
+    seen_gyms: set = set()
+    for g in activos:
+        gid = int(g["id_gimnasio"])
+        if gid in seen_gyms:
+            continue
+        seen_gyms.add(gid)
+        items_gym.append(
+            {
+                "contexto_id": f"{rol_target}:{gid}",
+                "rol": rol_target,
+                "etiqueta_rol": etiqueta,
+                "subrol_empleado": None,
+                "id_gimnasio": gid,
+                "nombre_gimnasio": g.get("nombre") or f"Gimnasio #{gid}",
+                "estado_gimnasio": g.get("estado", True),
+                "id_sucursal": None,
+                "nombre_sucursal": None,
+                "direccion_sucursal": None,
+            }
+        )
+    return items_gym
+
+
+def _normalize_expected_role(rol_esperado: Optional[str]) -> Optional[str]:
+    if not rol_esperado:
+        return None
+    clean = str(rol_esperado).strip().lower()
+    if clean in ("dueno", "dueño", "owner"):
+        return "dueño"
+    if clean in ("administrador", "admin"):
+        return "administrador"
+    if clean == "empleado":
+        return "empleado"
+    if clean == "socio":
+        return "socio"
+    return None
+
+
+async def _autenticar_con_rol_estricto(
+    req: LoginRequest,
+    rol_estricto: Optional[str] = None,
+) -> Dict[str, Any]:
+    """
+    Autentica contra Supabase Auth y valida estrictamente el rol real del usuario en BD.
+    El formulario nunca otorga permisos: si el usuario no posee el perfil activo requerido,
+    rechaza con 403 Forbidden.
     """
     anon_client = _require_supabase_anon()
     password_input = req.contrasena or req.password
@@ -470,39 +601,91 @@ async def login(req: LoginRequest):
     user_db = create_supabase_client_for_token(access_token)
     auth_identity = _build_auth_identity_from_supabase_user(user_obj, access_token)
 
-    # Resolver contexto; solo intenta vincular ficha precreada si el correo está realmente verificado
+    rol_objetivo = _normalize_expected_role(rol_estricto or req.rol_esperado)
+    req_role_header = "dueno" if rol_objetivo == "dueño" else rol_objetivo
+
     try:
-        contexto = await resolver_contexto_negocio(user_db, auth_identity)
+        contexto = await resolver_contexto_negocio(
+            user_db,
+            auth_identity,
+            requested_role=req_role_header,
+        )
     except HTTPException as exc:
         if exc.status_code == status.HTTP_403_FORBIDDEN and auth_identity.get("email_verified"):
-            for candidate_tipo in ("dueno", "administrador", "empleado"):
-                _try_auto_link_profile(user_db, auth_identity, candidate_tipo)
-            contexto = await resolver_contexto_negocio(user_db, auth_identity)
+            candidates = (
+                ("dueno",) if rol_objetivo == "dueño"
+                else (rol_objetivo,) if rol_objetivo in ("administrador", "empleado", "socio")
+                else ("dueno", "administrador", "empleado")
+            )
+            linked_any = False
+            for candidate_tipo in candidates:
+                if _try_auto_link_profile(user_db, auth_identity, candidate_tipo):
+                    linked_any = True
+            if linked_any:
+                contexto = await resolver_contexto_negocio(
+                    user_db,
+                    auth_identity,
+                    requested_role=req_role_header,
+                )
+            else:
+                if rol_objetivo:
+                    etiqueta = _ETIQUETAS_ROL_PRINCIPAL.get(rol_objetivo, rol_objetivo)
+                    raise HTTPException(
+                        status_code=status.HTTP_403_FORBIDDEN,
+                        detail=(
+                            f"Esta cuenta no posee un perfil activo de {etiqueta}. "
+                            "Ingresá desde el formulario correspondiente a tu rol."
+                        ),
+                    ) from exc
+                raise
         else:
+            if exc.status_code == status.HTTP_403_FORBIDDEN and rol_objetivo:
+                etiqueta = _ETIQUETAS_ROL_PRINCIPAL.get(rol_objetivo, rol_objetivo)
+                raise HTTPException(
+                    status_code=status.HTTP_403_FORBIDDEN,
+                    detail=(
+                        f"Esta cuenta no posee un perfil activo de {etiqueta}. "
+                        "Ingresá desde el formulario correspondiente a tu rol."
+                    ),
+                ) from exc
             raise
 
-    has_staff_profile = any(
-        p in (contexto.get("perfiles_disponibles") or [])
-        for p in ("dueño", "administrador", "empleado")
-    )
-    if not has_staff_profile:
-        if "socio" in (contexto.get("perfiles_disponibles") or []):
+    perfiles_disp = contexto.get("perfiles_disponibles") or []
+    if rol_objetivo:
+        if rol_objetivo not in perfiles_disp:
+            etiqueta = _ETIQUETAS_ROL_PRINCIPAL.get(rol_objetivo, rol_objetivo)
             raise HTTPException(
                 status_code=status.HTTP_403_FORBIDDEN,
-                detail="Esta cuenta corresponde a un Socio. Ingresa desde el Portal del Socio.",
+                detail=(
+                    f"Esta cuenta no posee un perfil activo de {etiqueta}. "
+                    "Ingresá desde el formulario correspondiente a tu rol."
+                ),
             )
-        raise HTTPException(
-            status_code=status.HTTP_403_FORBIDDEN,
-            detail="No se encontró un perfil de Dueño, Administrador o Empleado activo asociado a esta cuenta.",
-        )
+    else:
+        has_staff_profile = any(p in perfiles_disp for p in ("dueño", "administrador", "empleado"))
+        if not has_staff_profile:
+            if "socio" in perfiles_disp:
+                raise HTTPException(
+                    status_code=status.HTTP_403_FORBIDDEN,
+                    detail="Esta cuenta corresponde a un Socio. Ingresa desde el Portal del Socio.",
+                )
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail="No se encontró un perfil de Dueño, Administrador o Empleado activo asociado a esta cuenta.",
+            )
 
     rol_activo = contexto["rol"]
     if rol_activo == "dueño":
         perfil_base = contexto.get("dueno") or {}
     elif rol_activo == "administrador":
         perfil_base = contexto.get("administrador") or {}
-    else:
+    elif rol_activo == "empleado":
         perfil_base = contexto.get("empleado") or {}
+    else:
+        perfil_base = contexto.get("socio") or {}
+
+    contextos_disponibles = _build_contextos_disponibles(contexto, rol_activo)
+    requiere_seleccion = len(contextos_disponibles) > 1
 
     usuario_seguro = {
         **perfil_base,
@@ -510,10 +693,12 @@ async def login(req: LoginRequest):
         "id_dueno": contexto.get("id_dueno"),
         "id_administrador": contexto.get("id_administrador"),
         "id_empleado": contexto.get("id_empleado"),
+        "id_socio": contexto.get("id_socio"),
         "rol": rol_activo,
-        "perfiles_disponibles": contexto.get("perfiles_disponibles"),
+        "perfiles_disponibles": perfiles_disp,
         "roles_empleado": contexto.get("roles_empleado"),
         "permisos": contexto.get("permisos"),
+        "sucursales": contexto.get("sucursales"),
         "sucursales_asignadas": contexto.get("sucursales_asignadas"),
         "gimnasio": contexto.get("gimnasio"),
         "gimnasios": contexto.get("gimnasios"),
@@ -529,8 +714,39 @@ async def login(req: LoginRequest):
         "usuario": usuario_seguro,
         "gimnasio": contexto.get("gimnasio"),
         "gimnasios": contexto.get("gimnasios"),
+        "sucursales": contexto.get("sucursales"),
         "sucursales_asignadas": contexto.get("sucursales_asignadas"),
+        "contextos_disponibles": contextos_disponibles,
+        "requiere_seleccion_gimnasio": requiere_seleccion,
     }
+
+
+@router.post("/login", status_code=status.HTTP_200_OK)
+async def login(req: LoginRequest):
+    """
+    Inicio de sesión con Supabase Auth para personal organizacional y operativo
+    (Dueño, Administrador de Gimnasio o Empleado de Sucursal).
+    Si se envía `rol_esperado`, valida estrictamente que el usuario posea ese rol real.
+    """
+    return await _autenticar_con_rol_estricto(req, rol_estricto=req.rol_esperado)
+
+
+@router.post("/login-dueno", status_code=status.HTTP_200_OK)
+async def login_dueno(req: LoginRequest):
+    """Inicio de sesión exclusivo para Dueños. Rechaza con 403 si la cuenta no posee perfil Dueño."""
+    return await _autenticar_con_rol_estricto(req, rol_estricto="dueño")
+
+
+@router.post("/login-administrador", status_code=status.HTTP_200_OK)
+async def login_administrador(req: LoginRequest):
+    """Inicio de sesión exclusivo para Administradores organizacionales. Rechaza con 403 si no posee ese perfil activo."""
+    return await _autenticar_con_rol_estricto(req, rol_estricto="administrador")
+
+
+@router.post("/login-empleado", status_code=status.HTTP_200_OK)
+async def login_empleado(req: LoginRequest):
+    """Inicio de sesión exclusivo para Empleados operativos de sucursal. Rechaza con 403 si no posee ese perfil activo."""
+    return await _autenticar_con_rol_estricto(req, rol_estricto="empleado")
 
 
 @router.post("/login-socio", status_code=status.HTTP_200_OK)
@@ -622,6 +838,7 @@ async def login_socio(req: LoginSocioRequest):
         "gimnasios": contexto.get("gimnasios"),
     }
 
+    contextos_socio = _build_contextos_disponibles(contexto, "socio")
     return {
         "mensaje": "Inicio de sesión exitoso.",
         "token": access_token,
@@ -630,6 +847,8 @@ async def login_socio(req: LoginSocioRequest):
         "usuario": socio_seguro,
         "socio": socio_seguro,
         "gimnasios": contexto.get("gimnasios"),
+        "contextos_disponibles": contextos_socio,
+        "requiere_seleccion_gimnasio": len(contextos_socio) > 1,
     }
 
 
@@ -735,10 +954,13 @@ async def get_me(current_user: Dict[str, Any] = Depends(get_current_user)):
             "gimnasio": current_user.get("gimnasio"),
             "gimnasios": current_user.get("gimnasios"),
         }
+        contextos_me = _build_contextos_disponibles(current_user, "socio")
         return {
             "usuario": socio_resp,
             "gimnasios": current_user.get("gimnasios"),
             "membresias": membresias,
+            "contextos_disponibles": contextos_me,
+            "requiere_seleccion_gimnasio": len(contextos_me) > 1,
         }
 
     if rol == "empleado" and current_user.get("empleado"):
@@ -755,10 +977,13 @@ async def get_me(current_user: Dict[str, Any] = Depends(get_current_user)):
             "gimnasio": current_user.get("gimnasio"),
             "gimnasios": current_user.get("gimnasios"),
         }
+        contextos_me = _build_contextos_disponibles(current_user, "empleado")
         return {
             "usuario": emp_resp,
             "gimnasios": current_user.get("gimnasios"),
             "sucursales_asignadas": current_user.get("sucursales_asignadas"),
+            "contextos_disponibles": contextos_me,
+            "requiere_seleccion_gimnasio": len(contextos_me) > 1,
         }
 
     if rol == "administrador" and current_user.get("administrador"):
@@ -775,10 +1000,13 @@ async def get_me(current_user: Dict[str, Any] = Depends(get_current_user)):
             "gimnasios": current_user.get("gimnasios"),
             "sucursales": current_user.get("sucursales"),
         }
+        contextos_me = _build_contextos_disponibles(current_user, "administrador")
         return {
             "usuario": admin_resp,
             "gimnasios": current_user.get("gimnasios"),
             "sucursales": current_user.get("sucursales"),
+            "contextos_disponibles": contextos_me,
+            "requiere_seleccion_gimnasio": len(contextos_me) > 1,
         }
 
     # Caso Dueño
@@ -820,9 +1048,13 @@ async def get_me(current_user: Dict[str, Any] = Depends(get_current_user)):
         "sucursales": current_user.get("sucursales"),
         "estadisticas": estadisticas,
     }
+    contextos_dueno = _build_contextos_disponibles(current_user, "dueño")
     return {
         "usuario": dueno_resp,
         "gimnasios": current_user.get("gimnasios"),
+        "sucursales": current_user.get("sucursales"),
+        "contextos_disponibles": contextos_dueno,
+        "requiere_seleccion_gimnasio": len(contextos_dueno) > 1,
     }
 
 
@@ -1007,3 +1239,187 @@ async def update_owner_profile(
         response_payload["refresh_token"] = nuevo_refresh_token
 
     return response_payload
+
+
+@router.get("/contextos", status_code=status.HTTP_200_OK)
+async def listar_contextos_disponibles(current_user: Dict[str, Any] = Depends(get_current_user)):
+    """
+    Devuelve los gimnasios (y sucursales/sub-roles para empleados) en los que el usuario
+    autenticado posee una asociación activa y autorizada en BD.
+    """
+    rol_activo = current_user.get("rol")
+    contextos = _build_contextos_disponibles(current_user, rol_activo)
+    return {
+        "rol": rol_activo,
+        "perfiles_disponibles": current_user.get("perfiles_disponibles") or [],
+        "id_gimnasio": current_user.get("id_gimnasio"),
+        "id_sucursal": current_user.get("id_sucursal"),
+        "contextos_disponibles": contextos,
+        "requiere_seleccion_gimnasio": len(contextos) > 1,
+    }
+
+
+@router.post("/cambiar-contrasena", status_code=status.HTTP_200_OK)
+async def cambiar_contrasena(
+    req: CambiarContrasenaRequest,
+    current_user: Dict[str, Any] = Depends(get_current_user),
+):
+    """
+    Cambio voluntario de contraseña para cualquier usuario autenticado
+    (Dueño, Administrador, Empleado o Socio) usando exclusivamente Supabase Auth.
+    """
+    pass_limpia = req.nueva_contrasena.strip()
+    if len(pass_limpia) < 6:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="La nueva contraseña debe tener al menos 6 caracteres.",
+        )
+    if req.confirmar_contrasena is not None and req.confirmar_contrasena.strip() != pass_limpia:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="La confirmación de la contraseña no coincide con la nueva contraseña.",
+        )
+    if pass_limpia == req.contrasena_actual:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="La nueva contraseña debe ser diferente a la actual.",
+        )
+
+    access_token: str = str(current_user.get("access_token") or "").strip()
+    user_email = current_user.get("email")
+    if not access_token or not user_email:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Sesión inválida o expirada. Inicia sesión nuevamente.",
+        )
+
+    anon_client = _require_supabase_anon()
+    try:
+        anon_client.auth.sign_in_with_password(
+            {"email": user_email, "password": req.contrasena_actual}
+        )
+    except Exception as exc:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="La contraseña actual ingresada es incorrecta.",
+        ) from exc
+
+    await _update_supabase_auth_user_with_token(access_token, {"password": pass_limpia})
+
+    nuevo_token: Optional[str] = None
+    nuevo_refresh_token: Optional[str] = None
+    try:
+        re_auth = anon_client.auth.sign_in_with_password(
+            {"email": user_email, "password": pass_limpia}
+        )
+        re_session = getattr(re_auth, "session", None)
+        if re_session:
+            nuevo_token = getattr(re_session, "access_token", None)
+            nuevo_refresh_token = getattr(re_session, "refresh_token", None)
+    except Exception:
+        pass
+
+    invalidate_user_context_cache(current_user.get("auth_user_id"))
+
+    payload: Dict[str, Any] = {
+        "mensaje": "Contraseña actualizada correctamente.",
+    }
+    if nuevo_token:
+        payload["token"] = nuevo_token
+        payload["refresh_token"] = nuevo_refresh_token
+    return payload
+
+
+@router.post("/recuperar-contrasena", status_code=status.HTTP_200_OK)
+async def recuperar_contrasena(req: RecuperarContrasenaRequest):
+    """
+    Inicia el flujo seguro de recuperación de contraseña de Supabase Auth.
+    Siempre responde con un mensaje genérico sin revelar si el correo existe o no.
+    """
+    anon_client = _require_supabase_anon()
+    clean_email = str(req.email).strip().lower()
+    if not EMAIL_REGEX.match(clean_email):
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="El formato del correo electrónico no es válido.",
+        )
+    try:
+        anon_client.auth.reset_password_for_email(clean_email)
+    except Exception:
+        # Nunca revelar si el email existe o no en Supabase Auth
+        pass
+    return {
+        "mensaje": (
+            "Si existe una cuenta asociada a ese correo electrónico, recibirás un enlace "
+            "de recuperación enviado por Supabase Auth."
+        )
+    }
+
+
+@router.post("/logout", status_code=status.HTTP_200_OK)
+async def logout_usuario(auth_user: Dict[str, Any] = Depends(get_current_auth_user)):
+    """Limpia cachés de contexto del usuario en el servidor al cerrar sesión."""
+    invalidate_user_context_cache(auth_user.get("auth_user_id"))
+    return {"mensaje": "Sesión cerrada correctamente."}
+
+
+@router.post("/identidades/verificar", status_code=status.HTTP_200_OK)
+async def verificar_identidad_para_incorporacion(
+    req: VerificarIdentidadRequest,
+    current_user: Dict[str, Any] = Depends(get_current_user),
+):
+    """
+    Endpoint reutilizable y seguro de detección de personas existentes (socio, empleado o administrador)
+    exclusivamente para usuarios autenticados con permiso real de incorporación en el gimnasio/sucursal.
+    Nunca devuelve contraseñas, identificadores Auth ni datos privados de otros gimnasios.
+    """
+    from app.routers.gimnasios import verify_dueno_owns_gimnasio, verify_dueno_or_org_admin_of_gimnasio
+    from app.routers.socios import _verify_staff_can_manage_socios
+    from app.routers.sucursales import fetch_sucursal_or_404
+
+    target_gym_id = req.id_gimnasio or current_user.get("id_gimnasio")
+    target_suc_id = req.id_sucursal
+
+    if req.tipo_perfil == "socio":
+        staff_ctx, gym_id = _verify_staff_can_manage_socios(current_user, id_gimnasio=target_gym_id)
+        db = staff_ctx["supabase"]
+    elif req.tipo_perfil == "administrador":
+        if not target_gym_id:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="Debes indicar el gimnasio donde incorporar al administrador.",
+            )
+        dueno_ctx = verify_dueno_owns_gimnasio(current_user, int(target_gym_id))
+        gym_id = int(target_gym_id)
+        db = dueno_ctx["supabase"]
+    else:
+        # empleado
+        if target_suc_id is not None:
+            suc = fetch_sucursal_or_404(current_user["supabase"], int(target_suc_id))
+            gym_from_suc = int(suc["id_gimnasio"])
+            if target_gym_id is not None and int(target_gym_id) != gym_from_suc:
+                raise HTTPException(
+                    status_code=status.HTTP_403_FORBIDDEN,
+                    detail="La sucursal indicada no pertenece al gimnasio seleccionado.",
+                )
+            gym_id = gym_from_suc
+        elif target_gym_id is not None:
+            gym_id = int(target_gym_id)
+        else:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="Debes indicar un gimnasio o sucursal para verificar el empleado.",
+            )
+        mgr_ctx = verify_dueno_or_org_admin_of_gimnasio(current_user, gym_id)
+        db = mgr_ctx["supabase"]
+
+    raw_detection = detectar_identidad_para_incorporacion(
+        db=db,
+        actor_auth_user_id=current_user.get("auth_user_id"),
+        tipo_perfil=req.tipo_perfil,
+        gym_id=gym_id,
+        sucursal_id=target_suc_id,
+        dni=req.dni,
+        email=req.email,
+    )
+    return sanitize_detection_response(raw_detection)

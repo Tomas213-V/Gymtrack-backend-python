@@ -8,6 +8,11 @@ from app.core.dependencies import (
     _switch_profile_context_if_available,
 )
 from app.services.utils import get_data, raise_http_from_postgrest_error
+from app.services.account_provisioning import (
+    detectar_identidad_para_incorporacion,
+    validate_initial_password_policy,
+    aprovisionar_o_vincular_cuenta_auth,
+)
 from app.models.administrador import (
     RegistrarAdministradorGimnasioRequest,
     AdministradorUpdate,
@@ -127,6 +132,7 @@ async def registrar_administrador_logic(
 
     clean_email = str(req.email).strip().lower()
     clean_dni = req.dni.strip() if req.dni and req.dni.strip() else None
+    raw_password = req.contrasena_inicial or req.contrasena or req.password
 
     # Prevenir asociaciones activas duplicadas del mismo administrador en el mismo gimnasio
     res_existing_ag = (
@@ -148,6 +154,28 @@ async def registrar_administrador_logic(
                     status_code=status.HTTP_409_CONFLICT,
                     detail="El administrador ya posee una asignación activa en este gimnasio.",
                 )
+
+    detection = detectar_identidad_para_incorporacion(
+        db=db,
+        actor_auth_user_id=dueno_ctx.get("auth_user_id"),
+        tipo_perfil="administrador",
+        gym_id=int(target_gym_id),
+        dni=clean_dni,
+        email=clean_email,
+        skip_rate_limit=True,
+    )
+    if detection.get("conflicto_identidad"):
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail=detection["mensaje"],
+        )
+
+    validated_password = validate_initial_password_policy(
+        password_inicial=raw_password,
+        email=clean_email,
+        tiene_cuenta_auth_existente=bool(detection.get("tiene_cuenta_auth")),
+        perfil_ya_existia=bool(detection.get("existe_perfil_mismo_tipo")),
+    )
 
     rpc_params = {
         "p_id_gimnasio": int(target_gym_id),
@@ -171,6 +199,31 @@ async def registrar_administrador_logic(
         )
 
     creado = bool(resultado.get("creado"))
+    admin_data = resultado.get("administrador")
+    if isinstance(admin_data, dict):
+        admin_data = {k: v for k, v in admin_data.items() if k not in ("contrasena", "password")}
+
+    auth_info = {"cuenta_auth_creada": False, "cuenta_auth_reutilizada": False, "requiere_confirmacion_email": False}
+    if isinstance(admin_data, dict) and admin_data.get("id_administrador"):
+        if not creado and validated_password:
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail=(
+                    "Esta persona ya tiene un registro en GymTrack. "
+                    "No está permitido modificar su contraseña al incorporarla."
+                ),
+            )
+        auth_info = aprovisionar_o_vincular_cuenta_auth(
+            tipo_perfil="administrador",
+            pk_val=int(admin_data["id_administrador"]),
+            email=admin_data.get("email") or clean_email,
+            nombre=admin_data.get("nombre") or req.nombre,
+            apellido=admin_data.get("apellido") or req.apellido,
+            password_inicial=validated_password if creado else None,
+            existing_profile_auth_uid=admin_data.get("auth_user_id"),
+            existing_global_auth_uid=detection.get("_internal_global_auth_uid"),
+        )
+
     return {
         "mensaje": (
             "Administrador creado y asignado al gimnasio exitosamente."
@@ -178,8 +231,9 @@ async def registrar_administrador_logic(
             else "Administrador existente vinculado al gimnasio exitosamente."
         ),
         "creado": creado,
-        "administrador": resultado.get("administrador"),
+        "administrador": admin_data,
         "administrador_gimnasio": resultado.get("administrador_gimnasio"),
+        **auth_info,
     }
 
 

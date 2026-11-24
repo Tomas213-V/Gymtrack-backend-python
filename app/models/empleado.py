@@ -32,6 +32,10 @@ class RegistrarEmpleadoSucursalRequest(BaseModel):
     dni: Optional[str] = Field(default=None, max_length=20)
     email: Optional[str] = Field(default=None, max_length=254)
     telefono: Optional[str] = Field(default=None, max_length=30)
+    contrasena_inicial: Optional[str] = None
+    contrasena: Optional[str] = None
+    password: Optional[str] = None
+    confirmar_incorporacion: bool = False
 
     @field_validator("email")
     @classmethod

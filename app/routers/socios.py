@@ -11,6 +11,12 @@ from app.core.dependencies import (
     run_db_parallel,
 )
 from app.services.utils import get_data, raise_http_from_postgrest_error
+from app.services.account_provisioning import (
+    detectar_identidad_para_incorporacion,
+    sanitize_detection_response,
+    validate_initial_password_policy,
+    aprovisionar_o_vincular_cuenta_auth,
+)
 from app.models.socio import (
     SocioCreate,
     AsociarSocioGimnasioRequest,
@@ -522,54 +528,36 @@ async def update_perfil_socio(
 
 @router.get("/verificar-dni", status_code=status.HTTP_200_OK)
 async def verificar_dni_socio(
-    dni: str = Query(..., min_length=1),
+    dni: Optional[str] = Query(default=None),
+    email: Optional[str] = Query(default=None),
     id_gimnasio: Optional[int] = Query(default=None),
     current_user: Dict[str, Any] = Depends(get_current_user),
 ):
     """
-    Verifica si un DNI ya cuenta con una asociación `public.socio_gimnasio` en el gimnasio autorizado.
-    Bajo el modelo multi-gimnasio definitivo, un socio puede pertenecer simultáneamente a otros gimnasios.
+    Verifica de forma segura si un DNI y/o email corresponde a un socio ya registrado en GymTrack
+    o asociado al gimnasio actual, sin exponer datos personales sensibles de otros gimnasios.
     """
     staff_ctx, gym_id = _verify_staff_can_manage_socios(current_user, id_gimnasio=id_gimnasio)
-    clean_dni = str(dni).strip()
-    dni_sin_sep = re.sub(r"[\.\s-]", "", clean_dni)
-    dnis_buscados = {clean_dni, dni_sin_sep}
-
     db: Client = staff_ctx["supabase"]
-    [asociaciones] = await run_db_parallel(
-        db,
-        staff_ctx.get("access_token"),
-        [lambda c: _fetch_socio_gimnasios_for_gym(c, gym_id)],
-    )
-    match_sg = None
-    for sg in asociaciones:
-        s_obj = sg.get("socio") if isinstance(sg.get("socio"), dict) else {}
-        s_dni = str(s_obj.get("dni") or "").strip()
-        s_dni_clean = re.sub(r"[\.\s-]", "", s_dni)
-        if s_dni in dnis_buscados or (s_dni_clean and s_dni_clean in dnis_buscados):
-            match_sg = sg
-            break
 
-    if match_sg:
-        return {
-            "id_gimnasio": gym_id,
-            "existeEnEsteGimnasio": True,
-            "asociacionActiva": match_sg.get("estado") is not False,
-            "id_socio_gimnasio": match_sg.get("id_socio_gimnasio"),
-            "socio": _clean_socio_dict(match_sg.get("socio")),
-            "mensaje": (
-                "El socio ya posee una asociación activa en este gimnasio."
-                if match_sg.get("estado") is not False
-                else "El socio posee una asociación inactiva en este gimnasio y puede reactivarse."
-            ),
-        }
+    raw_det = detectar_identidad_para_incorporacion(
+        db=db,
+        actor_auth_user_id=staff_ctx.get("auth_user_id"),
+        tipo_perfil="socio",
+        gym_id=gym_id,
+        dni=dni,
+        email=email,
+    )
+    safe_det = sanitize_detection_response(raw_det)
 
     return {
         "id_gimnasio": gym_id,
-        "existeEnEsteGimnasio": False,
-        "asociacionActiva": False,
+        "existeEnEsteGimnasio": safe_det["ya_asociado_en_este_gimnasio"],
+        "asociacionActiva": safe_det["asociacion_activa_en_este_gimnasio"],
+        "cuentaExistente": safe_det["existe_en_gymtrack"],
         "id_socio_gimnasio": None,
         "socio": None,
+        **safe_det,
     }
 
 
@@ -655,17 +643,13 @@ async def create_socio(
             status_code=status.HTTP_403_FORBIDDEN,
             detail="No está permitido asignar manualmente auth_user_id al registrar un socio.",
         )
-    if req.contrasena is not None or req.password is not None:
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail="No se almacenan contraseñas en la tabla socio; el acceso se gestiona vía Supabase Auth.",
-        )
 
     staff_ctx, gym_id = _verify_staff_can_manage_socios(current_user, id_gimnasio=req.id_gimnasio)
     db: Client = staff_ctx["supabase"]
 
     clean_dni = str(req.dni).strip() if req.dni else None
     clean_email = str(req.email).strip().lower() if req.email else None
+    raw_password = req.contrasena_inicial or req.contrasena or req.password
 
     # Prevenir asociaciones activas duplicadas en este gimnasio
     asociaciones_gym = _fetch_socio_gimnasios_for_gym(db, gym_id)
@@ -678,8 +662,30 @@ async def create_socio(
         if (clean_dni and s_dni == clean_dni) or (clean_email and s_email == clean_email):
             raise HTTPException(
                 status_code=status.HTTP_409_CONFLICT,
-                detail="El socio ya posee una asociación activa en este gimnasio.",
+                detail="Esta persona ya está asociada a tu gimnasio.",
             )
+
+    detection = detectar_identidad_para_incorporacion(
+        db=db,
+        actor_auth_user_id=staff_ctx.get("auth_user_id"),
+        tipo_perfil="socio",
+        gym_id=gym_id,
+        dni=clean_dni,
+        email=clean_email,
+        skip_rate_limit=True,
+    )
+    if detection.get("conflicto_identidad"):
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail=detection["mensaje"],
+        )
+
+    validated_password = validate_initial_password_policy(
+        password_inicial=raw_password,
+        email=clean_email,
+        tiene_cuenta_auth_existente=bool(detection.get("tiene_cuenta_auth")),
+        perfil_ya_existia=bool(detection.get("existe_perfil_mismo_tipo")),
+    )
 
     rpc_params = {
         "p_id_gimnasio": gym_id,
@@ -709,8 +715,30 @@ async def create_socio(
         )
 
     creado = bool(resultado.get("creado"))
-    socio_clean = _clean_socio_dict(resultado.get("socio"))
+    raw_socio = resultado.get("socio") if isinstance(resultado.get("socio"), dict) else {}
+    socio_clean = _clean_socio_dict(raw_socio)
     socio_gimnasio = resultado.get("socio_gimnasio")
+
+    auth_info = {"cuenta_auth_creada": False, "cuenta_auth_reutilizada": False, "requiere_confirmacion_email": False}
+    if raw_socio.get("id_socio"):
+        if not creado and validated_password:
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail=(
+                    "Esta persona ya tiene un registro en GymTrack. "
+                    "No está permitido modificar su contraseña al incorporarla."
+                ),
+            )
+        auth_info = aprovisionar_o_vincular_cuenta_auth(
+            tipo_perfil="socio",
+            pk_val=int(raw_socio["id_socio"]),
+            email=raw_socio.get("email") or clean_email,
+            nombre=raw_socio.get("nombre") or req.nombre,
+            apellido=raw_socio.get("apellido") or req.apellido,
+            password_inicial=validated_password if creado else None,
+            existing_profile_auth_uid=raw_socio.get("auth_user_id"),
+            existing_global_auth_uid=detection.get("_internal_global_auth_uid"),
+        )
 
     return {
         "mensaje": (
@@ -722,6 +750,7 @@ async def create_socio(
         "id_gimnasio": gym_id,
         "socio": socio_clean,
         "socio_gimnasio": socio_gimnasio,
+        **auth_info,
     }
 
 

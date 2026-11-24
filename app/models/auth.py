@@ -42,6 +42,7 @@ class LoginRequest(BaseModel):
     email: Optional[str] = None
     contrasena: Optional[str] = None
     password: Optional[str] = None
+    rol_esperado: Optional[Literal["dueño", "dueno", "administrador", "empleado", "socio"]] = None
 
 
 class LoginSocioRequest(BaseModel):
@@ -49,6 +50,24 @@ class LoginSocioRequest(BaseModel):
     dni: Optional[Any] = None
     contrasena: Optional[str] = None
     password: Optional[str] = None
+
+
+class CambiarContrasenaRequest(BaseModel):
+    contrasena_actual: str = Field(..., min_length=1)
+    nueva_contrasena: str = Field(..., min_length=6)
+    confirmar_contrasena: Optional[str] = None
+
+
+class RecuperarContrasenaRequest(BaseModel):
+    email: str = Field(..., min_length=3, max_length=254)
+
+
+class VerificarIdentidadRequest(BaseModel):
+    tipo_perfil: Literal["socio", "empleado", "administrador"]
+    dni: Optional[str] = Field(default=None, max_length=20)
+    email: Optional[str] = Field(default=None, max_length=254)
+    id_gimnasio: Optional[int] = Field(default=None, gt=0)
+    id_sucursal: Optional[int] = Field(default=None, gt=0)
 
 
 class RefreshTokenRequest(BaseModel):
