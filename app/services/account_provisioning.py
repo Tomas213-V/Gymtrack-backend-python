@@ -24,6 +24,7 @@ from fastapi import HTTPException, status
 from supabase import Client
 
 from app.config import (
+    create_supabase_anon_client,
     create_supabase_client_for_token,
     supabase_admin,
     supabase_anon,
@@ -96,7 +97,11 @@ def _get_admin_client(override: Optional[Client] = None) -> Optional[Client]:
 
 
 def _get_anon_client(override: Optional[Client] = None) -> Optional[Client]:
-    return override if override is not None else supabase_anon
+    if override is not None:
+        return override
+    if supabase_anon is not None and type(supabase_anon).__module__.startswith("supabase"):
+        return create_supabase_anon_client()
+    return supabase_anon
 
 
 def _find_profile_row_by_email_or_dni(

@@ -151,10 +151,10 @@ def _verify_staff_can_manage_socios(
     return _resolve_staff_context_for_gym(
         current_user,
         id_gimnasio=id_gimnasio,
-        allowed_employee_subroles={"administrador", "recepcionista"},
+        allowed_employee_subroles={"administrador", "recepcionista", "entrenador"},
         denied_message=(
             "No tienes permisos para registrar, asociar o gestionar socios en este gimnasio "
-            "(requiere dueño, administrador organizacional, administrador de sucursal o recepcionista)."
+            "(requiere dueño, administrador organizacional o empleado activo del gimnasio)."
         ),
     )
 
@@ -166,10 +166,9 @@ def _verify_staff_can_change_socio_global_estado(
     ctx, _ = _resolve_staff_context_for_gym(
         current_user,
         id_gimnasio=id_gimnasio,
-        allowed_employee_subroles={"administrador"},
+        allowed_employee_subroles={"administrador", "recepcionista", "entrenador"},
         denied_message=(
-            "Solo el dueño, administrador organizacional o administrador de sucursal "
-            "puede cambiar el estado global del socio."
+            "No tienes permisos para cambiar el estado del socio en este gimnasio."
         ),
     )
     return ctx

@@ -43,20 +43,21 @@ def _resolve_dashboard_staff_scope(
     id_sucursal: Optional[int] = None,
 ) -> Tuple[Dict[str, Any], int, Optional[Set[int]], bool, bool]:
     """
-    Resuelve el alcance autorizado del staff para el dashboard organizacional:
+    Resuelve el alcance autorizado del staff para el dashboard organizacional/financiero:
       Retorna `(ctx, gym_id, allowed_sucursal_ids_or_None, can_view_financials, can_view_training)`.
     - Dueño / Administrador organizacional activo: alcance completo (todas las sucursales, finanzas y rutinas).
-    - Empleado operativo activo:
-      - `administrador`: sucursales asignadas, finanzas y rutinas.
-      - `recepcionista`: sucursales asignadas y finanzas (sin gestión de rutinas).
-      - `entrenador`: sucursales asignadas y rutinas (SIN acceso a información financiera `public.pago`).
-    - Socio o gimnasio/sucursal ajena: `403 Forbidden`.
+    - Empleado operativo, Socio o gimnasio/sucursal ajena: `403 Forbidden`.
     """
     ensure_active_organizational_assignments(current_user)
     if current_user.get("rol") == "socio" and current_user.get("requested_role") == "socio":
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,
             detail="Los socios no tienen acceso al dashboard organizacional.",
+        )
+    if current_user.get("rol") == "empleado" and current_user.get("requested_role") == "empleado":
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Los empleados no tienen acceso al dashboard financiero/organizacional.",
         )
 
     db_initial: Client = current_user["supabase"]
@@ -80,7 +81,7 @@ def _resolve_dashboard_staff_scope(
 
     def _try(ctx: Dict[str, Any]):
         rol = ctx.get("rol")
-        if rol == "socio":
+        if rol not in ("dueño", "administrador"):
             return None
         gid = int(target_gid) if target_gid is not None else (
             int(ctx["id_gimnasio"]) if ctx.get("id_gimnasio") is not None else None
@@ -94,24 +95,14 @@ def _resolve_dashboard_staff_scope(
             # Dueño o administrador organizacional
             suc_filter = {int(id_sucursal)} if id_sucursal is not None else None
             return ctx, gid, suc_filter, True, True
-        if not scope:
-            return None
-        if id_sucursal is not None and int(id_sucursal) not in scope:
-            return None
-        roles_gym = {
-            r.lower() for r in ((ctx.get("roles_empleado_por_gimnasio") or {}).get(gid) or [])
-        }
-        can_view_fin = bool(roles_gym.intersection({"administrador", "recepcionista"}))
-        can_view_train = bool(roles_gym.intersection({"administrador", "entrenador"}))
-        suc_filter = {int(id_sucursal)} if id_sucursal is not None else scope
-        return ctx, gid, suc_filter, can_view_fin, can_view_train
+        return None
 
     matched = _try(current_user)
     if matched is not None:
         return matched
 
     if current_user.get("requested_role") is None:
-        for candidate in ("dueño", "administrador", "empleado"):
+        for candidate in ("dueño", "administrador"):
             if candidate in (current_user.get("perfiles_disponibles") or []):
                 switched = _switch_profile_context_if_available(current_user, candidate)
                 matched = _try(switched)
@@ -120,7 +111,7 @@ def _resolve_dashboard_staff_scope(
 
     raise HTTPException(
         status_code=status.HTTP_403_FORBIDDEN,
-        detail="No tienes autorización para consultar el dashboard de este gimnasio o sucursal.",
+        detail="No tienes autorización para consultar el dashboard financiero de este gimnasio.",
     )
 
 

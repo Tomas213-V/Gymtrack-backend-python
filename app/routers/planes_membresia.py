@@ -50,8 +50,7 @@ def verify_can_manage_planes(
     política RLS `plan_write_dueno_o_admin`:
       - Dueño del gimnasio (`fn_dueno_posee_gimnasio`).
       - Administrador organizacional activo (`fn_admin_posee_gimnasio`).
-      - Empleado operativo con subrol activo `'administrador'` en ese gimnasio (`fn_empleado_en_gimnasio(id, array['administrador'])`).
-    Rechaza recepcionistas, entrenadores, socios y usuarios de otros gimnasios con `403 Forbidden`.
+    Rechaza empleados operativos, socios y usuarios de otros gimnasios con `403 Forbidden`.
     """
     ensure_active_organizational_assignments(current_user)
 
@@ -78,9 +77,6 @@ def verify_can_manage_planes(
             return None
         if rol in ("dueño", "administrador"):
             return resolved
-        if rol == "empleado":
-            roles_gym = {r.lower() for r in ((ctx.get("roles_empleado_por_gimnasio") or {}).get(resolved) or [])}
-            return resolved if "administrador" in roles_gym else None
         return None
 
     matched = _matches(current_user, target_gid)
@@ -88,7 +84,7 @@ def verify_can_manage_planes(
         return current_user, matched
 
     if current_user.get("requested_role") is None:
-        for candidate in ("dueño", "administrador", "empleado"):
+        for candidate in ("dueño", "administrador"):
             if candidate in (current_user.get("perfiles_disponibles") or []):
                 switched = _switch_profile_context_if_available(current_user, candidate)
                 matched = _matches(switched, target_gid)
@@ -97,7 +93,7 @@ def verify_can_manage_planes(
 
     raise HTTPException(
         status_code=status.HTTP_403_FORBIDDEN,
-        detail="No tienes permisos para administrar los planes de membresía de este gimnasio (requiere dueño, administrador organizacional o administrador de sucursal).",
+        detail="No tienes permisos para administrar los planes de membresía de este gimnasio (exclusivo para dueño o administrador organizacional).",
     )
 
 

@@ -74,7 +74,7 @@ def verify_can_manage_gym_training(
             roles_gym = {
                 r.lower() for r in ((ctx.get("roles_empleado_por_gimnasio") or {}).get(resolved) or [])
             }
-            return resolved if roles_gym.intersection({"administrador", "entrenador"}) else None
+            return resolved if roles_gym.intersection({"administrador", "recepcionista", "entrenador"}) else None
         return None
 
     matched = _matches(current_user, target_gid)
@@ -91,7 +91,7 @@ def verify_can_manage_gym_training(
 
     raise HTTPException(
         status_code=status.HTTP_403_FORBIDDEN,
-        detail="No tienes permisos para crear o modificar ejercicios/rutinas de este gimnasio (requiere dueño, administrador organizacional, administrador de sucursal o entrenador).",
+        detail="No tienes permisos para crear o modificar ejercicios/rutinas de este gimnasio (requiere dueño, administrador organizacional o empleado activo del gimnasio).",
     )
 
 
@@ -461,6 +461,21 @@ async def eliminar_ejercicio_gimnasio(
     manager_ctx, _ = verify_can_manage_gym_training(current_user, id_gimnasio=gym_id)
 
     db: Client = manager_ctx["supabase"]
+    if manager_ctx.get("rol") == "empleado":
+        res_upd = (
+            db.from_("ejercicio_gimnasio")
+            .update({"estado": False})
+            .eq("id_ejercicio_gimnasio", id_ejercicio_gimnasio)
+            .eq("id_gimnasio", gym_id)
+            .execute()
+        )
+        rows = get_data(res_upd) or []
+        return {
+            "mensaje": "Ejercicio del gimnasio desactivado lógicamente para conservar su historial.",
+            "desactivado": True,
+            "ejercicio": _enrich_gym_ejercicio(rows[0]) if rows else _enrich_gym_ejercicio(ej_actual),
+        }
+
     res_uso = (
         db.from_("rutina_ejercicio_gimnasio")
         .select("id_rutina_ejercicio_gimnasio")

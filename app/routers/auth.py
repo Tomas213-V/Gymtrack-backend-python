@@ -8,6 +8,7 @@ from app.config import (
     SUPABASE_URL,
     SUPABASE_ANON_KEY,
     supabase_anon,
+    create_supabase_anon_client,
     create_supabase_client_for_token,
     validate_supabase_configuration,
 )
@@ -59,6 +60,17 @@ def _require_supabase_anon() -> Client:
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail="El cliente público de Supabase Auth no está configurado en el servidor.",
         )
+    # Si es el cliente real de supabase-py, crear una instancia aislada por operación
+    # para que `_listen_to_auth_events` nunca contamine headers/sesión entre usuarios.
+    # En tests unitarios donde `supabase_anon` es un mock/fake, se retorna el objeto parcheado.
+    if type(supabase_anon).__module__.startswith("supabase"):
+        try:
+            return create_supabase_anon_client()
+        except RuntimeError as exc:
+            raise HTTPException(
+                status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+                detail=str(exc),
+            ) from exc
     return supabase_anon
 
 
@@ -235,6 +247,7 @@ async def register_owner(req: RegisterOwnerRequest):
 
     user_db = create_supabase_client_for_token(access_token)
     auth_uid = str(auth_user.id)
+    invalidate_user_context_cache(auth_uid)
 
     try:
         res_dueno = (
@@ -381,6 +394,7 @@ async def register_socio(req: RegisterSocioRequest):
 
     user_db = create_supabase_client_for_token(access_token)
     auth_uid = str(auth_user.id)
+    invalidate_user_context_cache(auth_uid)
 
     try:
         res_socio = (

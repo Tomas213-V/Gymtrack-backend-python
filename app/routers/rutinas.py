@@ -647,7 +647,7 @@ async def desactivar_o_eliminar_rutina_gimnasio(
         .execute()
     )
     asigs = get_data(res_asig) or []
-    if isinstance(asigs, list) and len(asigs) > 0:
+    if manager_ctx.get("rol") == "empleado" or (isinstance(asigs, list) and len(asigs) > 0):
         res_upd = (
             db.from_("rutina_gimnasio")
             .update({"estado": False})
@@ -657,7 +657,7 @@ async def desactivar_o_eliminar_rutina_gimnasio(
         )
         rows = get_data(res_upd) or []
         return {
-            "mensaje": "Rutina de gimnasio desactivada lógicamente para conservar asignaciones históricas.",
+            "mensaje": "Rutina de gimnasio desactivada lógicamente para conservar su historial y permitir reutilizarla.",
             "desactivada": True,
             "rutina": rows[0] if rows else actual,
         }

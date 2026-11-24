@@ -78,18 +78,13 @@ def _verify_can_list_empleados(
             if gid is not None:
                 return gid in gym_ids
             return bool(gym_ids)
-        if rol == "empleado":
-            roles_por_gym = ctx.get("roles_empleado_por_gimnasio") or {}
-            if gid is not None:
-                return "administrador" in (roles_por_gym.get(gid) or [])
-            return any("administrador" in (rlist or []) for rlist in roles_por_gym.values())
         return False
 
     if _profile_allows_read(current_user, target_gym_id):
         return {**current_user, "_resolved_target_gym_id": target_gym_id}
 
     if current_user.get("requested_role") is None:
-        for candidate in ("dueño", "administrador", "empleado"):
+        for candidate in ("dueño", "administrador"):
             if candidate in (current_user.get("perfiles_disponibles") or []):
                 switched = _switch_profile_context_if_available(current_user, candidate)
                 if _profile_allows_read(switched, target_gym_id):
@@ -97,7 +92,7 @@ def _verify_can_list_empleados(
 
     raise HTTPException(
         status_code=status.HTTP_403_FORBIDDEN,
-        detail="No tienes permisos para consultar empleados en este gimnasio o sucursal (requiere dueño, administrador organizacional o administrador de sucursal).",
+        detail="No tienes permisos para consultar el padrón de empleados (exclusivo para dueño o administrador organizacional).",
     )
 
 

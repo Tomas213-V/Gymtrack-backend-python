@@ -270,6 +270,22 @@ def has_service_role() -> bool:
     return supabase_admin is not None
 
 
+def create_supabase_anon_client() -> Client:
+    """
+    Crea un cliente público (`anon`) aislado para una operación puntual de Supabase Auth
+    (`sign_up`, `sign_in_with_password`, `refresh_session`, `reset_password_for_email`).
+    Evita reutilizar el singleton `supabase_anon`, ya que `supabase-py` muta
+    `options.headers["Authorization"]` y `auth._headers["Authorization"]` al recibir
+    eventos `SIGNED_IN`, lo que podría contaminar llamadas concurrentes o posteriores.
+    """
+    validate_supabase_configuration()
+    return create_client(
+        SUPABASE_URL,
+        SUPABASE_ANON_KEY,
+        options=_build_common_client_options(),
+    )
+
+
 def create_supabase_client_for_token(access_token: str) -> Client:
     """
     Crea un cliente de Supabase acotado al access_token de Supabase Auth del usuario.

@@ -244,7 +244,7 @@ def _verify_staff_can_manage_sucursal_asistencia(
 
     def _matches(ctx: Dict[str, Any]) -> Optional[Dict[str, Any]]:
         scope = _get_staff_authorized_sucursal_ids_for_gym(
-            ctx, gym_id, {"administrador", "recepcionista"}
+            ctx, gym_id, {"administrador", "recepcionista", "entrenador"}
         )
         if scope is None:
             return ctx
@@ -266,7 +266,7 @@ def _verify_staff_can_manage_sucursal_asistencia(
 
     raise HTTPException(
         status_code=status.HTTP_403_FORBIDDEN,
-        detail="No tienes autorización para gestionar asistencias en esta sucursal (requiere dueño, administrador organizacional o administrador/recepcionista asignado a la sucursal).",
+        detail="No tienes autorización para gestionar asistencias en esta sucursal (requiere dueño, administrador organizacional o empleado activo asignado a la sucursal).",
     )
 
 
@@ -758,10 +758,10 @@ async def registrar_salida_abierta(
             # Validar igualmente que el actor tenga al menos rol de gestión de asistencias
             if current_user.get("rol") == "empleado":
                 all_roles = {r.lower() for r in (current_user.get("roles_empleado") or [])}
-                if not all_roles.intersection({"administrador", "recepcionista"}):
+                if not all_roles.intersection({"administrador", "recepcionista", "entrenador"}):
                     raise HTTPException(
                         status_code=status.HTTP_403_FORBIDDEN,
-                        detail="No tienes autorización para registrar salidas de asistencias (requiere dueño, administrador o recepcionista).",
+                        detail="No tienes autorización para registrar salidas de asistencias.",
                     )
             raise HTTPException(
                 status_code=status.HTTP_404_NOT_FOUND,

@@ -12,36 +12,23 @@ from app.config import create_supabase_client_for_token
 from app.core.security import verify_supabase_access_token
 from app.services.utils import get_data
 
-# Permisos operativos por sub-rol de empleado en sucursal (tabla public.empleado_sucursal)
+# Permisos operativos del rol Empleado (restringido exclusivamente a los 6 módulos habilitados:
+# Socios, Rutinas, Ejercicios, Pagos, Asistencia y Perfil; sin Dashboard, Planes, Sucursales ni Empleados)
+PERMISOS_OPERATIVOS_EMPLEADO: List[str] = [
+    "ver_socios",
+    "gestionar_socios",
+    "gestionar_membresias",
+    "gestionar_pagos",
+    "ver_asistencias",
+    "gestionar_asistencias",
+    "gestionar_ejercicios",
+    "gestionar_rutinas",
+]
+
 PERMISOS_POR_ROL_EMPLEADO: Dict[str, List[str]] = {
-    "administrador": [
-        "ver_dashboard",
-        "gestionar_socios",
-        "gestionar_planes",
-        "gestionar_membresias",
-        "gestionar_pagos",
-        "gestionar_asistencias",
-        "gestionar_ejercicios",
-        "gestionar_rutinas",
-        "ver_empleados",
-        "ver_sucursales",
-    ],
-    "recepcionista": [
-        "ver_dashboard",
-        "gestionar_socios",
-        "gestionar_membresias",
-        "gestionar_pagos",
-        "gestionar_asistencias",
-        "ver_sucursales",
-    ],
-    "entrenador": [
-        "ver_dashboard",
-        "ver_socios",
-        "ver_asistencias",
-        "gestionar_ejercicios",
-        "gestionar_rutinas",
-        "ver_sucursales",
-    ],
+    "administrador": list(PERMISOS_OPERATIVOS_EMPLEADO),
+    "recepcionista": list(PERMISOS_OPERATIVOS_EMPLEADO),
+    "entrenador": list(PERMISOS_OPERATIVOS_EMPLEADO),
 }
 
 # Permisos organizacionales de un administrador de gimnasio (tabla public.administrador_gimnasio)
