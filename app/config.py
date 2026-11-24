@@ -1,6 +1,7 @@
 import os
 from pathlib import Path
 from typing import Optional, List, Mapping, Tuple
+import httpx
 import jwt
 from dotenv import load_dotenv
 from supabase import create_client, Client, ClientOptions
@@ -176,11 +177,43 @@ SUPABASE_JWT_ALGORITHMS: List[str] = [
     alg.strip().upper() for alg in _raw_algs.split(",") if alg.strip()
 ] or ["ES256", "RS256", "HS256"]
 
-# 3. Clientes de Supabase
-_COMMON_CLIENT_OPTIONS = ClientOptions(
-    auto_refresh_token=False,
-    persist_session=False,
+# 3. Clientes de Supabase con pool compartido de conexiones TCP/TLS
+_SHARED_HTTP_LIMITS = httpx.Limits(
+    max_connections=100,
+    max_keepalive_connections=30,
+    keepalive_expiry=60.0,
 )
+_SHARED_HTTP_TRANSPORT = httpx.HTTPTransport(limits=_SHARED_HTTP_LIMITS, retries=1)
+
+
+class _PooledHTTPTransport(httpx.BaseTransport):
+    """Wrapper sobre el transporte HTTP compartido que evita cerrar el pool global."""
+
+    def __init__(self, transport: httpx.BaseTransport):
+        self._transport = transport
+
+    def handle_request(self, request: httpx.Request) -> httpx.Response:
+        return self._transport.handle_request(request)
+
+    def close(self) -> None:
+        # Conserva el pool keep-alive compartido vivo entre requests.
+        return None
+
+
+def _build_pooled_httpx_client() -> httpx.Client:
+    return httpx.Client(
+        transport=_PooledHTTPTransport(_SHARED_HTTP_TRANSPORT),
+        timeout=httpx.Timeout(15.0, connect=5.0),
+    )
+
+
+def _build_common_client_options() -> ClientOptions:
+    return ClientOptions(
+        auto_refresh_token=False,
+        persist_session=False,
+        httpx_client=_build_pooled_httpx_client(),
+    )
+
 
 supabase_anon: Optional[Client] = None
 if SUPABASE_URL and SUPABASE_ANON_KEY and not is_service_role_key(SUPABASE_ANON_KEY):
@@ -188,7 +221,7 @@ if SUPABASE_URL and SUPABASE_ANON_KEY and not is_service_role_key(SUPABASE_ANON_
         supabase_anon = create_client(
             SUPABASE_URL,
             SUPABASE_ANON_KEY,
-            options=_COMMON_CLIENT_OPTIONS,
+            options=_build_common_client_options(),
         )
     except Exception as e:
         print(f"[ERROR] No se pudo inicializar el cliente público de Supabase: {e}")
@@ -200,7 +233,7 @@ if SUPABASE_URL and SUPABASE_SERVICE_ROLE_KEY:
         supabase_admin = create_client(
             SUPABASE_URL,
             SUPABASE_SERVICE_ROLE_KEY,
-            options=_COMMON_CLIENT_OPTIONS,
+            options=_build_common_client_options(),
         )
     except Exception as e:
         print(f"[ERROR] No se pudo inicializar el cliente administrativo de Supabase: {e}")
@@ -259,6 +292,7 @@ def create_supabase_client_for_token(access_token: str) -> Client:
         headers={"Authorization": f"Bearer {clean_token}"},
         auto_refresh_token=False,
         persist_session=False,
+        httpx_client=_build_pooled_httpx_client(),
     )
     client = create_client(SUPABASE_URL, SUPABASE_ANON_KEY, options=options)
     try:

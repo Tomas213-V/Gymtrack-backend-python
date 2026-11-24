@@ -13,6 +13,7 @@ from fastapi.responses import JSONResponse
 from postgrest.exceptions import APIError
 
 from app.config import PORT, HOST, supabase, validate_supabase_configuration
+from app.core.dependencies import invalidate_user_context_cache
 from app.services.utils import map_postgrest_error
 from app.routers import (
     auth,
@@ -50,7 +51,16 @@ app = FastAPI(
     lifespan=lifespan,
 )
 
-# 2. MIDDLEWARES GLOBALES (CORS)
+# 2. MIDDLEWARES GLOBALES (CORS + INVALIDACIÓN DE CACHÉ EN MUTACIONES)
+@app.middleware("http")
+async def invalidate_profile_cache_on_mutation(request: Request, call_next):
+    try:
+        return await call_next(request)
+    finally:
+        if request.method.upper() not in ("GET", "HEAD", "OPTIONS"):
+            invalidate_user_context_cache(None)
+
+
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],

@@ -8,6 +8,7 @@ from supabase import Client
 from app.core.dependencies import (
     get_current_user,
     _switch_profile_context_if_available,
+    run_db_parallel,
 )
 from app.services.utils import get_data, raise_http_from_postgrest_error
 from app.models.socio import (
@@ -535,7 +536,11 @@ async def verificar_dni_socio(
     dnis_buscados = {clean_dni, dni_sin_sep}
 
     db: Client = staff_ctx["supabase"]
-    asociaciones = _fetch_socio_gimnasios_for_gym(db, gym_id)
+    [asociaciones] = await run_db_parallel(
+        db,
+        staff_ctx.get("access_token"),
+        [lambda c: _fetch_socio_gimnasios_for_gym(c, gym_id)],
+    )
     match_sg = None
     for sg in asociaciones:
         s_obj = sg.get("socio") if isinstance(sg.get("socio"), dict) else {}
@@ -585,7 +590,11 @@ async def get_socios(
     estado_bool = _parse_optional_bool_estado(estado)
 
     db: Client = staff_ctx["supabase"]
-    asociaciones = _fetch_socio_gimnasios_for_gym(db, gym_id)
+    [asociaciones] = await run_db_parallel(
+        db,
+        staff_ctx.get("access_token"),
+        [lambda c: _fetch_socio_gimnasios_for_gym(c, gym_id)],
+    )
 
     filtradas: List[Dict[str, Any]] = []
     term = search.strip().lower() if search and search.strip() else None

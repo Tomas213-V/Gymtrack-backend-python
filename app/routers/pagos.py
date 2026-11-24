@@ -3,7 +3,7 @@ from typing import Dict, Any, Optional, List
 from fastapi import APIRouter, HTTPException, status, Depends, Query, Path
 from supabase import Client
 
-from app.core.dependencies import get_current_user
+from app.core.dependencies import get_current_user, run_db_parallel
 from app.services.utils import get_data
 from app.models.pago import PagoCreate, PagoUpdateEstado
 from app.routers.socios import (
@@ -157,9 +157,13 @@ async def get_resumen_pagos(
     """
     staff_ctx, gym_id = _verify_staff_can_access_pagos(current_user, id_gimnasio=id_gimnasio)
     db: Client = staff_ctx["supabase"]
+    access_token = staff_ctx.get("access_token")
 
-    res = db.from_("pago").select(PAGO_SELECT).order("fecha_pago", desc=True).execute()
-    rows = get_data(res)
+    [rows] = await run_db_parallel(
+        db,
+        access_token,
+        [lambda c: get_data(c.from_("pago").select(PAGO_SELECT).order("fecha_pago", desc=True).execute())],
+    )
     pagos = _filter_pagos_by_gym_and_params(
         rows if isinstance(rows, list) else [],
         gym_id=gym_id,
@@ -199,16 +203,22 @@ async def get_pagos_membresias(
     """Lista socios asociados (`socio_gimnasio`) y sus contrataciones (`membresia_socio`) para cobro."""
     staff_ctx, gym_id = _verify_staff_can_access_pagos(current_user, id_gimnasio=id_gimnasio)
     db: Client = staff_ctx["supabase"]
+    access_token = staff_ctx.get("access_token")
 
-    asociaciones = _fetch_socio_gimnasios_for_gym(db, gym_id)
-    res_m = (
-        db.from_("membresia_socio")
-        .select(MEMBRESIA_SOCIO_SELECT)
-        .eq("id_gimnasio", gym_id)
-        .order("fecha_vencimiento", desc=True)
-        .execute()
+    asociaciones, membs = await run_db_parallel(
+        db,
+        access_token,
+        [
+            lambda c: _fetch_socio_gimnasios_for_gym(c, gym_id),
+            lambda c: get_data(
+                c.from_("membresia_socio")
+                .select(MEMBRESIA_SOCIO_SELECT)
+                .eq("id_gimnasio", gym_id)
+                .order("fecha_vencimiento", desc=True)
+                .execute()
+            ),
+        ],
     )
-    membs = get_data(res_m)
     membs_by_sg: Dict[int, List[Dict[str, Any]]] = {}
     for m in (membs if isinstance(membs, list) else []):
         if isinstance(m, dict) and int(m.get("id_gimnasio") or 0) == gym_id:
@@ -279,9 +289,13 @@ async def get_pagos(
 
     staff_ctx, gym_id = _verify_staff_can_access_pagos(current_user, id_gimnasio=id_gimnasio)
     db: Client = staff_ctx["supabase"]
+    access_token = staff_ctx.get("access_token")
 
-    res = db.from_("pago").select(PAGO_SELECT).order("id_pago", desc=True).execute()
-    rows = get_data(res)
+    [rows] = await run_db_parallel(
+        db,
+        access_token,
+        [lambda c: get_data(c.from_("pago").select(PAGO_SELECT).order("id_pago", desc=True).execute())],
+    )
     filtrados = _filter_pagos_by_gym_and_params(
         rows if isinstance(rows, list) else [],
         gym_id=gym_id,

@@ -7,6 +7,7 @@ from supabase import Client
 from app.core.dependencies import (
     get_current_user,
     _switch_profile_context_if_available,
+    run_db_parallel,
 )
 from app.services.utils import get_data
 from app.routers.gimnasios import ensure_active_organizational_assignments
@@ -159,24 +160,86 @@ async def get_dashboard_admin(
     primer_dia_mes_anterior = date(year_anterior, mes_anterior, 1)
     ultimo_dia_mes_anterior = date(year_anterior, mes_anterior, calendar.monthrange(year_anterior, mes_anterior)[1])
 
-    # 1. Gimnasio y sucursales autorizadas
-    res_gym = (
-        db.from_("gimnasio")
-        .select("id_gimnasio, nombre, telefono, email, fecha_registro, estado, id_dueno")
-        .eq("id_gimnasio", gym_id)
-        .maybe_single()
-        .execute()
-    )
-    gimnasio = get_data(res_gym) or {"id_gimnasio": gym_id}
+    # Ejecutar todas las consultas independientes del dashboard en paralelo (sin bloquear event loop)
+    access_token = staff_ctx.get("access_token")
 
-    res_sucs = (
-        db.from_("sucursal")
-        .select("id_sucursal, descripcion, direccion, telefono, estado, id_gimnasio")
-        .eq("id_gimnasio", gym_id)
-        .order("id_sucursal", desc=False)
-        .execute()
-    )
-    sucursales_raw = get_data(res_sucs) or []
+    def _q_gym(client: Client):
+        return get_data(
+            client.from_("gimnasio")
+            .select("id_gimnasio, nombre, telefono, email, fecha_registro, estado, id_dueno")
+            .eq("id_gimnasio", gym_id)
+            .maybe_single()
+            .execute()
+        ) or {"id_gimnasio": gym_id}
+
+    def _q_sucs(client: Client):
+        return get_data(
+            client.from_("sucursal")
+            .select("id_sucursal, descripcion, direccion, telefono, estado, id_gimnasio")
+            .eq("id_gimnasio", gym_id)
+            .order("id_sucursal", desc=False)
+            .execute()
+        ) or []
+
+    def _q_asoc(client: Client):
+        return _fetch_socio_gimnasios_for_gym(client, gym_id)
+
+    def _q_memb(client: Client):
+        return get_data(
+            client.from_("membresia_socio")
+            .select(MEMBRESIA_SOCIO_SELECT)
+            .eq("id_gimnasio", gym_id)
+            .order("fecha_vencimiento", desc=True)
+            .execute()
+        ) or []
+
+    def _q_asist(client: Client):
+        return get_data(
+            client.from_("asistencia_socio")
+            .select(ASISTENCIA_SELECT)
+            .order("hora_ingreso", desc=True)
+            .execute()
+        ) or []
+
+    def _q_pagos(client: Client):
+        return get_data(client.from_("pago").select(PAGO_SELECT).order("id_pago", desc=True).execute()) or []
+
+    def _q_rutinas(client: Client):
+        return get_data(
+            client.from_("rutina_gimnasio")
+            .select("id_rutina_gimnasio, id_gimnasio, estado")
+            .eq("id_gimnasio", gym_id)
+            .execute()
+        ) or []
+
+    def _q_asignaciones(client: Client):
+        return get_data(
+            client.from_("rutinas_asignadas_socio_gimnasio")
+            .select(ASIGNACION_SELECT)
+            .eq("id_gimnasio", gym_id)
+            .execute()
+        ) or []
+
+    query_tasks: List[Any] = [_q_gym, _q_sucs, _q_asoc, _q_memb, _q_asist]
+    if can_view_financials:
+        query_tasks.append(_q_pagos)
+    if can_view_training:
+        query_tasks.extend([_q_rutinas, _q_asignaciones])
+
+    query_results = await run_db_parallel(db, access_token, query_tasks)
+    idx = 0
+    gimnasio = query_results[idx]; idx += 1
+    sucursales_raw = query_results[idx]; idx += 1
+    asociaciones = query_results[idx]; idx += 1
+    membresias_raw = query_results[idx]; idx += 1
+    asist_raw = query_results[idx]; idx += 1
+    pagos_raw = query_results[idx] if can_view_financials else []
+    if can_view_financials:
+        idx += 1
+    rg_raw = query_results[idx] if can_view_training else []
+    asig_raw = query_results[idx + 1] if can_view_training else []
+
+    # 1. Gimnasio y sucursales autorizadas
     sucursales = [
         s for s in (sucursales_raw if isinstance(sucursales_raw, list) else [])
         if isinstance(s, dict)
@@ -185,7 +248,6 @@ async def get_dashboard_admin(
     ]
 
     # 2. Socios asociados (`public.socio_gimnasio`)
-    asociaciones = _fetch_socio_gimnasios_for_gym(db, gym_id)
     total_socios = len(asociaciones)
     socios_activos = sum(1 for a in asociaciones if a.get("estado") is True)
     socios_inactivos = sum(1 for a in asociaciones if a.get("estado") is not True)
@@ -197,14 +259,6 @@ async def get_dashboard_admin(
     )
 
     # 3. Contrataciones de membresías (`public.membresia_socio`)
-    res_memb = (
-        db.from_("membresia_socio")
-        .select(MEMBRESIA_SOCIO_SELECT)
-        .eq("id_gimnasio", gym_id)
-        .order("fecha_vencimiento", desc=True)
-        .execute()
-    )
-    membresias_raw = get_data(res_memb) or []
     membresias_list = [
         m for m in (membresias_raw if isinstance(membresias_raw, list) else [])
         if isinstance(m, dict) and int(m.get("id_gimnasio") or 0) == gym_id
@@ -277,8 +331,6 @@ async def get_dashboard_admin(
     ultimos_pagos: List[Dict[str, Any]] = []
 
     if can_view_financials:
-        res_pagos = db.from_("pago").select(PAGO_SELECT).order("id_pago", desc=True).execute()
-        pagos_raw = get_data(res_pagos) or []
         pagos_list = [
             p for p in (pagos_raw if isinstance(pagos_raw, list) else [])
             if isinstance(p, dict) and _extract_gym_id_from_pago(p) == gym_id
@@ -371,8 +423,6 @@ async def get_dashboard_admin(
             )
 
     # 5. Asistencias (`public.asistencia_socio`, excluyendo 'anulada' y filtradas por sucursales autorizadas)
-    res_asist = db.from_("asistencia_socio").select(ASISTENCIA_SELECT).order("hora_ingreso", desc=True).execute()
-    asist_raw = get_data(res_asist) or []
     asistencias_list = [
         a for a in (asist_raw if isinstance(asist_raw, list) else [])
         if isinstance(a, dict)
@@ -438,24 +488,12 @@ async def get_dashboard_admin(
     # 6. Rutinas y asignaciones (`public.rutina_gimnasio` y `public.rutinas_asignadas_socio_gimnasio`)
     rutinas_kpi: Optional[Dict[str, Any]] = None
     if can_view_training:
-        res_rg = (
-            db.from_("rutina_gimnasio")
-            .select("id_rutina_gimnasio, id_gimnasio, estado")
-            .eq("id_gimnasio", gym_id)
-            .execute()
-        )
         rg_rows = [
-            r for r in (get_data(res_rg) or [])
+            r for r in (rg_raw if isinstance(rg_raw, list) else [])
             if isinstance(r, dict) and int(r.get("id_gimnasio") or 0) == gym_id
         ]
-        res_asig = (
-            db.from_("rutinas_asignadas_socio_gimnasio")
-            .select(ASIGNACION_SELECT)
-            .eq("id_gimnasio", gym_id)
-            .execute()
-        )
         asig_rows = [
-            a for a in (get_data(res_asig) or [])
+            a for a in (asig_raw if isinstance(asig_raw, list) else [])
             if isinstance(a, dict) and int(a.get("id_gimnasio") or 0) == gym_id
         ]
         rutinas_kpi = {

@@ -5,6 +5,7 @@ from supabase import Client
 from app.core.dependencies import (
     get_current_user,
     _switch_profile_context_if_available,
+    run_db_parallel,
 )
 from app.services.utils import get_data
 from app.models.ejercicio import (
@@ -170,8 +171,13 @@ async def get_ejercicios_disponibles_socio(
     socio_ctx = _resolve_socio_profile_context(current_user)
     own_socio_id = int(socio_ctx["id_socio"])
     db: Client = socio_ctx["supabase"]
+    access_token = socio_ctx.get("access_token")
 
-    asocs = _fetch_socio_gimnasios_for_socio(db, own_socio_id)
+    [asocs] = await run_db_parallel(
+        db,
+        access_token,
+        [lambda c: _fetch_socio_gimnasios_for_socio(c, own_socio_id)],
+    )
     active_gym_ids = {
         int(a["id_gimnasio"])
         for a in asocs
@@ -186,16 +192,38 @@ async def get_ejercicios_disponibles_socio(
     origen_norm = origen.strip().lower()
     ejercicios_propios: List[Dict[str, Any]] = []
     ejercicios_gimnasio: List[Dict[str, Any]] = []
+    target_gyms = [id_gimnasio] if id_gimnasio is not None else sorted(active_gym_ids)
 
-    if origen_norm in ("todos", "propio"):
-        res_p = (
-            db.from_("ejercicio_socio")
+    fetch_propios = origen_norm in ("todos", "propio")
+    fetch_gimnasio = origen_norm in ("todos", "gimnasio") and bool(target_gyms)
+
+    def _q_propios(c: Client):
+        return get_data(
+            c.from_("ejercicio_socio")
             .select(EJERCICIO_SOCIO_COLUMNS)
             .eq("id_socio", own_socio_id)
             .order("nombre", desc=False)
             .execute()
-        )
-        raw_p = get_data(res_p) or []
+        ) or []
+
+    def _q_gimnasio(c: Client):
+        q_g = c.from_("ejercicio_gimnasio").select(EJERCICIO_GIMNASIO_COLUMNS)
+        if len(target_gyms) == 1:
+            q_g = q_g.eq("id_gimnasio", target_gyms[0])
+        else:
+            q_g = q_g.in_("id_gimnasio", target_gyms)
+        return get_data(q_g.order("nombre", desc=False).execute()) or []
+
+    tasks = []
+    if fetch_propios:
+        tasks.append(_q_propios)
+    if fetch_gimnasio:
+        tasks.append(_q_gimnasio)
+
+    results = await run_db_parallel(db, access_token, tasks)
+    idx = 0
+    if fetch_propios:
+        raw_p = results[idx]; idx += 1
         ejercicios_propios = [
             _enrich_socio_ejercicio(e)
             for e in _filter_ejercicios(
@@ -206,26 +234,18 @@ async def get_ejercicios_disponibles_socio(
             if int(e.get("id_socio") or 0) == own_socio_id
         ]
 
-    if origen_norm in ("todos", "gimnasio"):
-        target_gyms = [id_gimnasio] if id_gimnasio is not None else sorted(active_gym_ids)
-        if target_gyms:
-            q_g = db.from_("ejercicio_gimnasio").select(EJERCICIO_GIMNASIO_COLUMNS)
-            if len(target_gyms) == 1:
-                q_g = q_g.eq("id_gimnasio", target_gyms[0])
-            else:
-                q_g = q_g.in_("id_gimnasio", target_gyms)
-            res_g = q_g.order("nombre", desc=False).execute()
-            raw_g = get_data(res_g) or []
-            ejercicios_gimnasio = [
-                _enrich_gym_ejercicio(e)
-                for e in _filter_ejercicios(
-                    raw_g if isinstance(raw_g, list) else [],
-                    grupo_muscular=grupo_muscular,
-                    search=search,
-                    only_active=True,
-                )
-                if int(e.get("id_gimnasio") or 0) in set(target_gyms)
-            ]
+    if fetch_gimnasio:
+        raw_g = results[idx]
+        ejercicios_gimnasio = [
+            _enrich_gym_ejercicio(e)
+            for e in _filter_ejercicios(
+                raw_g if isinstance(raw_g, list) else [],
+                grupo_muscular=grupo_muscular,
+                search=search,
+                only_active=True,
+            )
+            if int(e.get("id_gimnasio") or 0) in set(target_gyms)
+        ]
 
     return {
         "id_socio": own_socio_id,

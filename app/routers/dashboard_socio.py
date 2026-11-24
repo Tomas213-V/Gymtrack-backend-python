@@ -4,7 +4,7 @@ from typing import Dict, Any, Optional, List
 from fastapi import APIRouter, HTTPException, status, Depends, Query, Request
 from supabase import Client
 
-from app.core.dependencies import get_current_user
+from app.core.dependencies import get_current_user, run_db_parallel
 from app.services.utils import (
     formatear_precio_ars,
     calcular_metricas_membresia,
@@ -111,54 +111,104 @@ async def get_dashboard_socio(
     socio_ctx = _resolve_socio_profile_context(current_user)
     own_socio_id = int(socio_ctx["id_socio"])
     db: Client = socio_ctx["supabase"]
+    access_token = socio_ctx.get("access_token")
 
     req_gym = id_gimnasio or current_user.get("requested_gym_id")
 
-    res_socio = (
-        db.from_("socio")
-        .select("id_socio, dni, telefono, fecha_alta, estado, nombre, apellido, email")
-        .eq("id_socio", own_socio_id)
-        .maybe_single()
-        .execute()
+    # Fase 1 en paralelo: perfil socio, asociaciones multi-gimnasio, pagos, asistencias y rutinas personales
+    def _q_socio(client: Client):
+        return get_data(
+            client.from_("socio")
+            .select("id_socio, dni, telefono, fecha_alta, estado, nombre, apellido, email")
+            .eq("id_socio", own_socio_id)
+            .maybe_single()
+            .execute()
+        )
+
+    def _q_asoc(client: Client):
+        return _fetch_socio_gimnasios_for_socio(client, own_socio_id)
+
+    def _q_pagos(client: Client):
+        return get_data(client.from_("pago").select(PAGO_SELECT).order("fecha_pago", desc=True).execute()) or []
+
+    def _q_asist(client: Client):
+        return get_data(
+            client.from_("asistencia_socio")
+            .select(ASISTENCIA_SELECT)
+            .eq("id_socio", own_socio_id)
+            .order("hora_ingreso", desc=True)
+            .execute()
+        ) or []
+
+    def _q_rp(client: Client):
+        return get_data(
+            client.from_("rutina_socio")
+            .select(RUTINA_SOCIO_SELECT)
+            .eq("id_socio", own_socio_id)
+            .order("id_rutina_socio", desc=True)
+            .execute()
+        ) or []
+
+    socio, asociaciones, pagos_raw, asist_raw, rp_raw = await run_db_parallel(
+        db,
+        access_token,
+        [_q_socio, _q_asoc, _q_pagos, _q_asist, _q_rp],
     )
-    socio = get_data(res_socio)
+
     if not isinstance(socio, dict):
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
             detail="No se encontraron datos del socio en el sistema.",
         )
 
-    asociaciones = _fetch_socio_gimnasios_for_socio(db, own_socio_id)
     assoc_activa = _select_active_gym_for_socio(asociaciones, int(req_gym) if req_gym else None)
     selected_gym_id = int(assoc_activa["id_gimnasio"]) if assoc_activa else None
     selected_sg_id = int(assoc_activa["id_socio_gimnasio"]) if assoc_activa else None
     gimnasio_activo = assoc_activa.get("gimnasio") if isinstance(assoc_activa, dict) else None
 
-    # 1. Membresía vigente en el gimnasio seleccionado
+    # Fase 2 en paralelo (dependiente de selected_sg_id): membresía vigente y rutinas asignadas
     membresia_actual: Optional[Dict[str, Any]] = None
+    rutinas_asignadas: List[Dict[str, Any]] = []
     if selected_sg_id is not None:
-        res_m = (
-            db.from_("membresia_socio")
-            .select(MEMBRESIA_SOCIO_SELECT)
-            .eq("id_socio_gimnasio", selected_sg_id)
-            .order("fecha_vencimiento", desc=True)
-            .execute()
-        )
+        def _q_memb(client: Client):
+            return get_data(
+                client.from_("membresia_socio")
+                .select(MEMBRESIA_SOCIO_SELECT)
+                .eq("id_socio_gimnasio", selected_sg_id)
+                .order("fecha_vencimiento", desc=True)
+                .execute()
+            ) or []
+
+        def _q_ra(client: Client):
+            return get_data(
+                client.from_("rutinas_asignadas_socio_gimnasio")
+                .select(ASIGNACION_SELECT)
+                .eq("id_socio_gimnasio", selected_sg_id)
+                .order("id_rutina_asignada", desc=True)
+                .execute()
+            ) or []
+
+        raw_m_list, raw_ra_list = await run_db_parallel(db, access_token, [_q_memb, _q_ra])
         raw_m = [
-            m for m in (get_data(res_m) or [])
+            m for m in (raw_m_list if isinstance(raw_m_list, list) else [])
             if isinstance(m, dict) and int(m.get("id_socio_gimnasio") or 0) == selected_sg_id
         ]
         membresia_actual = next(
             (m for m in raw_m if str(m.get("estado") or "").lower() == "activa"),
             next((m for m in raw_m if str(m.get("estado") or "").lower() == "pendiente"), None),
         )
+        rutinas_asignadas = [
+            a for a in (raw_ra_list if isinstance(raw_ra_list, list) else [])
+            if isinstance(a, dict)
+            and int(a.get("id_socio_gimnasio") or 0) == selected_sg_id
+            and a.get("estado") is True
+        ]
 
     metricas_membresia = calcular_metricas_membresia(membresia_actual)
 
     # 2. Último pago del socio (en el gimnasio seleccionado si existe)
-    res_pagos = db.from_("pago").select(PAGO_SELECT).order("fecha_pago", desc=True).execute()
     pagos_propios = [
-        p for p in (get_data(res_pagos) or [])
+        p for p in (pagos_raw if isinstance(pagos_raw, list) else [])
         if isinstance(p, dict)
         and _extract_socio_id_from_pago(p) == own_socio_id
         and (selected_gym_id is None or _extract_gym_id_from_pago(p) == selected_gym_id)
@@ -168,15 +218,8 @@ async def get_dashboard_socio(
     # 3. Asistencias del socio (`public.asistencia_socio`, excluyendo anuladas)
     hoy = date.today()
     inicio_mes = date(hoy.year, hoy.month, 1).isoformat()
-    res_asist = (
-        db.from_("asistencia_socio")
-        .select(ASISTENCIA_SELECT)
-        .eq("id_socio", own_socio_id)
-        .order("hora_ingreso", desc=True)
-        .execute()
-    )
     asist_validas = [
-        a for a in (get_data(res_asist) or [])
+        a for a in (asist_raw if isinstance(asist_raw, list) else [])
         if isinstance(a, dict)
         and int(a.get("id_socio") or 0) == own_socio_id
         and str(a.get("estado") or "").lower() != "anulada"
@@ -186,35 +229,12 @@ async def get_dashboard_socio(
         1 for a in asist_validas if str(a.get("hora_ingreso") or "").split("T")[0] >= inicio_mes
     )
 
-    # 4. Rutinas personales (`public.rutina_socio`) y asignadas (`public.rutinas_asignadas_socio_gimnasio`)
-    res_rp = (
-        db.from_("rutina_socio")
-        .select(RUTINA_SOCIO_SELECT)
-        .eq("id_socio", own_socio_id)
-        .order("id_rutina_socio", desc=True)
-        .execute()
-    )
+    # 4. Rutinas personales (`public.rutina_socio`)
     rutinas_personales = [
         _sort_rutina_items(r, "rutina_ejercicio_socio")
-        for r in (get_data(res_rp) or [])
+        for r in (rp_raw if isinstance(rp_raw, list) else [])
         if isinstance(r, dict) and int(r.get("id_socio") or 0) == own_socio_id and r.get("estado") is True
     ]
-
-    rutinas_asignadas: List[Dict[str, Any]] = []
-    if selected_sg_id is not None:
-        res_ra = (
-            db.from_("rutinas_asignadas_socio_gimnasio")
-            .select(ASIGNACION_SELECT)
-            .eq("id_socio_gimnasio", selected_sg_id)
-            .order("id_rutina_asignada", desc=True)
-            .execute()
-        )
-        rutinas_asignadas = [
-            a for a in (get_data(res_ra) or [])
-            if isinstance(a, dict)
-            and int(a.get("id_socio_gimnasio") or 0) == selected_sg_id
-            and a.get("estado") is True
-        ]
 
     plan_obj = (
         membresia_actual.get("membresia_gimnasio")

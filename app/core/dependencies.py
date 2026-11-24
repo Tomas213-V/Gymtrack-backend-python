@@ -1,5 +1,10 @@
+import asyncio
+import copy
+import hashlib
+import threading
+import time
 import urllib.parse
-from typing import Optional, Dict, Any, List, Set, Sequence
+from typing import Optional, Dict, Any, List, Set, Sequence, Tuple, Callable
 from fastapi import Request, HTTPException, status, Depends
 from supabase import Client
 
@@ -233,12 +238,153 @@ def _safe_query_list(
     return data if isinstance(data, list) else []
 
 
+_PROFILE_CACHE_TTL_SECONDS = 8.0
+_PROFILE_CACHE_MAX_ENTRIES = 256
+_PROFILE_CACHE_LOCK = threading.Lock()
+_PROFILE_RAW_CACHE: Dict[str, Tuple[float, Dict[str, Any]]] = {}
+_PROFILE_INFLIGHT_LOCKS: Dict[Tuple[str, int], asyncio.Lock] = {}
+
+
+def _is_real_supabase_client(db: Any) -> bool:
+    """Detecta si `db` es un cliente real de Supabase y no un doble/mock de pruebas."""
+    return db is not None and type(db).__module__.startswith("supabase")
+
+
+async def run_db_parallel(
+    db: Client,
+    access_token: Optional[str],
+    tasks: Sequence[Callable[[Client], Any]],
+) -> List[Any]:
+    """
+    Ejecuta operaciones de lectura PostgREST en paralelo usando hilos dedicados y clientes
+    aislados cuando `db` es un cliente real de Supabase, evitando bloquear el event loop.
+    En tests unitarios con mocks/fakes (`_is_real_supabase_client(db) == False`), ejecuta
+    secuencialmente de forma síncrona para mantener compatibilidad determinística.
+    """
+    if not tasks:
+        return []
+    if not _is_real_supabase_client(db):
+        return [fn(db) for fn in tasks]
+    if len(tasks) == 1 or not access_token:
+        results = []
+        for fn in tasks:
+            results.append(await asyncio.to_thread(fn, db))
+        return results
+    return list(
+        await asyncio.gather(
+            *[
+                asyncio.to_thread(fn, create_supabase_client_for_token(access_token))
+                for fn in tasks
+            ]
+        )
+    )
+
+
+def _build_profile_cache_key(auth_user: Dict[str, Any]) -> Optional[str]:
+    uid = str(auth_user.get("auth_user_id") or "").strip()
+    token = str(auth_user.get("access_token") or "").strip()
+    if not uid or not token:
+        return None
+    token_hash = hashlib.sha256(token.encode("utf-8")).hexdigest()[:16]
+    return f"{uid}:{token_hash}"
+
+
+def invalidate_user_context_cache(auth_user_id: Optional[str] = None) -> None:
+    """Invalida la caché efímera de perfiles de negocio del usuario o de todos si `auth_user_id` es None."""
+    with _PROFILE_CACHE_LOCK:
+        if not auth_user_id:
+            _PROFILE_RAW_CACHE.clear()
+            return
+        prefix = f"{auth_user_id}:"
+        for key in [k for k in _PROFILE_RAW_CACHE if k.startswith(prefix)]:
+            _PROFILE_RAW_CACHE.pop(key, None)
+
+
+def _get_cached_profile_bundle(cache_key: str) -> Optional[Dict[str, Any]]:
+    now = time.monotonic()
+    with _PROFILE_CACHE_LOCK:
+        entry = _PROFILE_RAW_CACHE.get(cache_key)
+        if not entry:
+            return None
+        expires_at, payload = entry
+        if now >= expires_at:
+            _PROFILE_RAW_CACHE.pop(cache_key, None)
+            return None
+        return copy.deepcopy(payload)
+
+
+def _set_cached_profile_bundle(cache_key: str, payload: Dict[str, Any]) -> None:
+    now = time.monotonic()
+    with _PROFILE_CACHE_LOCK:
+        if len(_PROFILE_RAW_CACHE) >= _PROFILE_CACHE_MAX_ENTRIES:
+            expired = [k for k, (exp, _) in _PROFILE_RAW_CACHE.items() if now >= exp]
+            for k in expired:
+                _PROFILE_RAW_CACHE.pop(k, None)
+            if len(_PROFILE_RAW_CACHE) >= _PROFILE_CACHE_MAX_ENTRIES:
+                _PROFILE_RAW_CACHE.pop(next(iter(_PROFILE_RAW_CACHE)), None)
+        _PROFILE_RAW_CACHE[cache_key] = (
+            now + _PROFILE_CACHE_TTL_SECONDS,
+            copy.deepcopy(payload),
+        )
+
+
+def _get_inflight_async_lock(cache_key: str) -> asyncio.Lock:
+    loop_id = id(asyncio.get_running_loop())
+    lock_key = (cache_key, loop_id)
+    with _PROFILE_CACHE_LOCK:
+        lock = _PROFILE_INFLIGHT_LOCKS.get(lock_key)
+        if lock is None:
+            if len(_PROFILE_INFLIGHT_LOCKS) > 512:
+                _PROFILE_INFLIGHT_LOCKS.clear()
+            lock = asyncio.Lock()
+            _PROFILE_INFLIGHT_LOCKS[lock_key] = lock
+        return lock
+
+
+def _query_single_with_token(
+    access_token: str,
+    table: str,
+    select_clause: str,
+    eq_col: str,
+    eq_val: Any,
+) -> Optional[Dict[str, Any]]:
+    """Ejecuta `_safe_query_single` con cliente aislado para llamadas paralelas seguras por hilo."""
+    worker_db = create_supabase_client_for_token(access_token)
+    return _safe_query_single(worker_db, table, select_clause, eq_col, eq_val)
+
+
+def _query_list_with_token(
+    access_token: str,
+    table: str,
+    select_clause: str,
+    eq_col: Optional[str] = None,
+    eq_val: Any = None,
+    in_col: Optional[str] = None,
+    in_vals: Optional[Sequence[Any]] = None,
+    order_col: Optional[str] = None,
+) -> List[Dict[str, Any]]:
+    """Ejecuta `_safe_query_list` con cliente aislado para llamadas paralelas seguras por hilo."""
+    worker_db = create_supabase_client_for_token(access_token)
+    return _safe_query_list(
+        worker_db,
+        table,
+        select_clause,
+        eq_col=eq_col,
+        eq_val=eq_val,
+        in_col=in_col,
+        in_vals=in_vals,
+        order_col=order_col,
+    )
+
+
 async def resolver_contexto_negocio(
     db: Client,
     auth_user: Dict[str, Any],
     requested_gym_id: Optional[int] = None,
     requested_sucursal_id: Optional[int] = None,
     requested_role: Optional[str] = None,
+    use_cache: bool = False,
+    store_cache: bool = False,
 ) -> Dict[str, Any]:
     """
     Resuelve desde la base de datos todos los perfiles de negocio asociados al `auth_user_id`
@@ -252,140 +398,281 @@ async def resolver_contexto_negocio(
       perfiles deshabilitados (403) y accesos a gimnasios o sucursales no autorizados (403).
     """
     uid = auth_user["auth_user_id"]
+    is_real_client = _is_real_supabase_client(db)
+    cache_key = _build_profile_cache_key(auth_user) if is_real_client else None
 
-    # 1. Consultar los 4 perfiles de negocio reales vinculados a auth_user_id
-    dueno = _safe_query_single(
-        db,
-        "dueno",
-        "id_dueno, auth_user_id, nombre, apellido, email, fecha_creacion",
-        "auth_user_id",
-        uid,
+    _SELECT_DUENO = "id_dueno, auth_user_id, nombre, apellido, email, fecha_creacion"
+    _SELECT_ADMIN = (
+        "id_administrador, auth_user_id, nombre, apellido, dni, email, telefono, estado, fecha_creacion, "
+        "administrador_gimnasio("
+        "id_administrador_gimnasio, id_administrador, id_gimnasio, fecha_asignacion, estado, "
+        "gimnasio(id_gimnasio, nombre, telefono, email, fecha_registro, estado, id_dueno)"
+        ")"
+    )
+    _SELECT_EMPLEADO = (
+        "id_empleado, auth_user_id, nombre, apellido, dni, email, telefono, estado, fecha_creacion, "
+        "empleado_sucursal("
+        "id_empleado_sucursal, rol, id_empleado, id_sucursal, estado, fecha_asignacion, "
+        "sucursal("
+        "id_sucursal, direccion, telefono, descripcion, fecha_registro, estado, id_gimnasio, "
+        "gimnasio(id_gimnasio, nombre, telefono, email, fecha_registro, estado, id_dueno)"
+        ")"
+        ")"
+    )
+    _SELECT_SOCIO = (
+        "id_socio, auth_user_id, dni, telefono, fecha_alta, estado, nombre, apellido, email, "
+        "socio_gimnasio("
+        "id_socio_gimnasio, id_socio, id_gimnasio, fecha_alta, estado, creado_en, "
+        "gimnasio(id_gimnasio, nombre, telefono, email, fecha_registro, estado, id_dueno), "
+        "membresia_socio("
+        "id_membresia_socio, id_socio_gimnasio, id_membresia_gimnasio, id_gimnasio, "
+        "precio, duracion_dias_contratados, limite_asistencias_semanales, limite_asistencias_totales, "
+        "fecha_inicio, fecha_vencimiento, estado"
+        ")"
+        ")"
     )
 
-    administrador = _safe_query_single(
-        db,
-        "administrador",
-        (
-            "id_administrador, auth_user_id, nombre, apellido, dni, email, telefono, estado, fecha_creacion, "
-            "administrador_gimnasio("
-            "id_administrador_gimnasio, id_administrador, id_gimnasio, fecha_asignacion, estado, "
-            "gimnasio(id_gimnasio, nombre, telefono, email, fecha_registro, estado, id_dueno)"
-            ")"
-        ),
-        "auth_user_id",
-        uid,
-    )
+    cached_bundle: Optional[Dict[str, Any]] = None
+    if use_cache and cache_key:
+        cached_bundle = _get_cached_profile_bundle(cache_key)
 
-    empleado = _safe_query_single(
-        db,
-        "empleado",
-        (
-            "id_empleado, auth_user_id, nombre, apellido, dni, email, telefono, estado, fecha_creacion, "
-            "empleado_sucursal("
-            "id_empleado_sucursal, rol, id_empleado, id_sucursal, estado, fecha_asignacion, "
-            "sucursal("
-            "id_sucursal, direccion, telefono, descripcion, fecha_registro, estado, id_gimnasio, "
-            "gimnasio(id_gimnasio, nombre, telefono, email, fecha_registro, estado, id_dueno)"
-            ")"
-            ")"
-        ),
-        "auth_user_id",
-        uid,
-    )
-
-    socio = _safe_query_single(
-        db,
-        "socio",
-        (
-            "id_socio, auth_user_id, dni, telefono, fecha_alta, estado, nombre, apellido, email, "
-            "socio_gimnasio("
-            "id_socio_gimnasio, id_socio, id_gimnasio, fecha_alta, estado, creado_en, "
-            "gimnasio(id_gimnasio, nombre, telefono, email, fecha_registro, estado, id_dueno), "
-            "membresia_socio("
-            "id_membresia_socio, id_socio_gimnasio, id_membresia_gimnasio, id_gimnasio, "
-            "precio, duracion_dias_contratados, limite_asistencias_semanales, limite_asistencias_totales, "
-            "fecha_inicio, fecha_vencimiento, estado"
-            ")"
-            ")"
-        ),
-        "auth_user_id",
-        uid,
-    )
-
-    # 2. Clasificar perfiles encontrados vs perfiles activos
-    tiene_algun_registro = any(p is not None for p in (dueno, administrador, empleado, socio))
-    if not tiene_algun_registro:
-        raise HTTPException(
-            status_code=status.HTTP_403_FORBIDDEN,
-            detail="Tu cuenta autenticada no posee ningún perfil de negocio vinculado en GymTrack.",
+    async def _fetch_profiles_live() -> Tuple[
+        Optional[Dict[str, Any]],
+        Optional[Dict[str, Any]],
+        Optional[Dict[str, Any]],
+        Optional[Dict[str, Any]],
+    ]:
+        if is_real_client:
+            token = auth_user["access_token"]
+            return await asyncio.gather(
+                asyncio.to_thread(_safe_query_single, db, "dueno", _SELECT_DUENO, "auth_user_id", uid),
+                asyncio.to_thread(_query_single_with_token, token, "administrador", _SELECT_ADMIN, "auth_user_id", uid),
+                asyncio.to_thread(_query_single_with_token, token, "empleado", _SELECT_EMPLEADO, "auth_user_id", uid),
+                asyncio.to_thread(_query_single_with_token, token, "socio", _SELECT_SOCIO, "auth_user_id", uid),
+            )
+        return (
+            _safe_query_single(db, "dueno", _SELECT_DUENO, "auth_user_id", uid),
+            _safe_query_single(db, "administrador", _SELECT_ADMIN, "auth_user_id", uid),
+            _safe_query_single(db, "empleado", _SELECT_EMPLEADO, "auth_user_id", uid),
+            _safe_query_single(db, "socio", _SELECT_SOCIO, "auth_user_id", uid),
         )
 
-    perfiles_disponibles: List[str] = []
-    perfiles_inactivos: Set[str] = set()
+    async def _resolve_bundle() -> Dict[str, Any]:
+        dueno, administrador, empleado, socio = await _fetch_profiles_live()
 
-    if dueno is not None:
-        perfiles_disponibles.append("dueño")
+        tiene_algun_registro = any(p is not None for p in (dueno, administrador, empleado, socio))
+        if not tiene_algun_registro:
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail="Tu cuenta autenticada no posee ningún perfil de negocio vinculado en GymTrack.",
+            )
 
-    if administrador is not None:
-        raw_ag_check = administrador.get("administrador_gimnasio") or []
-        if not isinstance(raw_ag_check, list):
-            raw_ag_check = [raw_ag_check] if raw_ag_check else []
-        tiene_ag_activa = any(
-            isinstance(ag, dict) and ag.get("estado") is not False and ag.get("id_gimnasio") is not None
-            for ag in raw_ag_check
-        )
-        if administrador.get("estado") is False or not tiene_ag_activa:
-            perfiles_inactivos.add("administrador")
+        perfiles_disp: List[str] = []
+        perfiles_inact: Set[str] = set()
+
+        if dueno is not None:
+            perfiles_disp.append("dueño")
+
+        if administrador is not None:
+            raw_ag_check = administrador.get("administrador_gimnasio") or []
+            if not isinstance(raw_ag_check, list):
+                raw_ag_check = [raw_ag_check] if raw_ag_check else []
+            tiene_ag_activa = any(
+                isinstance(ag, dict) and ag.get("estado") is not False and ag.get("id_gimnasio") is not None
+                for ag in raw_ag_check
+            )
+            if administrador.get("estado") is False or not tiene_ag_activa:
+                perfiles_inact.add("administrador")
+            else:
+                perfiles_disp.append("administrador")
+
+        if empleado is not None:
+            raw_es_check = empleado.get("empleado_sucursal") or []
+            if not isinstance(raw_es_check, list):
+                raw_es_check = [raw_es_check] if raw_es_check else []
+            tiene_es_activa = any(
+                isinstance(es, dict) and es.get("estado") is not False and es.get("id_sucursal") is not None
+                for es in raw_es_check
+            )
+            if empleado.get("estado") is False or not tiene_es_activa:
+                perfiles_inact.add("empleado")
+            else:
+                perfiles_disp.append("empleado")
+
+        if socio is not None:
+            if socio.get("estado") is False:
+                perfiles_inact.add("socio")
+            else:
+                perfiles_disp.append("socio")
+
+        gyms_dueno: List[Dict[str, Any]] = []
+        sucursales_dueno: List[Dict[str, Any]] = []
+        sucursales_admin: List[Dict[str, Any]] = []
+        sucursales_socio: List[Dict[str, Any]] = []
+
+        # Preparar IDs de admin y socio para consultar sus sucursales en paralelo con las de dueño
+        admin_asig: List[Dict[str, Any]] = []
+        gym_ids_admin: List[int] = []
+        if "administrador" in perfiles_disp and administrador is not None:
+            raw_ag = administrador.get("administrador_gimnasio") or []
+            if not isinstance(raw_ag, list):
+                raw_ag = [raw_ag] if raw_ag else []
+            admin_asig = [
+                ag for ag in raw_ag
+                if isinstance(ag, dict) and ag.get("estado") is not False and ag.get("id_gimnasio") is not None
+            ]
+            for ag in admin_asig:
+                gid = int(ag["id_gimnasio"])
+                if gid not in gym_ids_admin:
+                    gym_ids_admin.append(gid)
+
+        gym_ids_socio_activos: Set[int] = set()
+        if "socio" in perfiles_disp and socio is not None:
+            raw_sg = socio.get("socio_gimnasio") or []
+            if not isinstance(raw_sg, list):
+                raw_sg = [raw_sg] if raw_sg else []
+            for sg in raw_sg:
+                if isinstance(sg, dict) and sg.get("id_gimnasio") is not None and sg.get("estado") is not False:
+                    gym_ids_socio_activos.add(int(sg["id_gimnasio"]))
+
+        def _fetch_dueno_chain() -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
+            if "dueño" not in perfiles_disp or dueno is None:
+                return [], []
+            g_list = _safe_query_list(
+                db,
+                "gimnasio",
+                "id_gimnasio, nombre, telefono, email, fecha_registro, estado, id_dueno",
+                eq_col="id_dueno",
+                eq_val=dueno["id_dueno"],
+                order_col="id_gimnasio",
+            )
+            g_ids = [int(g["id_gimnasio"]) for g in g_list if g.get("id_gimnasio") is not None]
+            s_list = (
+                _safe_query_list(
+                    db,
+                    "sucursal",
+                    "id_sucursal, direccion, telefono, descripcion, fecha_registro, estado, id_gimnasio",
+                    in_col="id_gimnasio",
+                    in_vals=g_ids,
+                    order_col="id_sucursal",
+                )
+                if g_ids
+                else []
+            )
+            return g_list, s_list
+
+        if is_real_client:
+            token = auth_user["access_token"]
+            tasks = [asyncio.to_thread(_fetch_dueno_chain)]
+            if gym_ids_admin:
+                tasks.append(
+                    asyncio.to_thread(
+                        _query_list_with_token,
+                        token,
+                        "sucursal",
+                        "id_sucursal, direccion, telefono, descripcion, fecha_registro, estado, id_gimnasio",
+                        None,
+                        None,
+                        "id_gimnasio",
+                        gym_ids_admin,
+                        "id_sucursal",
+                    )
+                )
+            else:
+                tasks.append(asyncio.sleep(0, result=[]))
+            if gym_ids_socio_activos:
+                tasks.append(
+                    asyncio.to_thread(
+                        _query_list_with_token,
+                        token,
+                        "sucursal",
+                        "id_sucursal, direccion, telefono, descripcion, fecha_registro, estado, id_gimnasio",
+                        None,
+                        None,
+                        "id_gimnasio",
+                        sorted(gym_ids_socio_activos),
+                        "id_sucursal",
+                    )
+                )
+            else:
+                tasks.append(asyncio.sleep(0, result=[]))
+
+            (gyms_dueno, sucursales_dueno), sucursales_admin, sucursales_socio = await asyncio.gather(*tasks)
         else:
-            perfiles_disponibles.append("administrador")
+            gyms_dueno, sucursales_dueno = _fetch_dueno_chain()
+            sucursales_admin = (
+                _safe_query_list(
+                    db,
+                    "sucursal",
+                    "id_sucursal, direccion, telefono, descripcion, fecha_registro, estado, id_gimnasio",
+                    in_col="id_gimnasio",
+                    in_vals=gym_ids_admin,
+                    order_col="id_sucursal",
+                )
+                if gym_ids_admin
+                else []
+            )
+            sucursales_socio = (
+                _safe_query_list(
+                    db,
+                    "sucursal",
+                    "id_sucursal, direccion, telefono, descripcion, fecha_registro, estado, id_gimnasio",
+                    in_col="id_gimnasio",
+                    in_vals=sorted(gym_ids_socio_activos),
+                    order_col="id_sucursal",
+                )
+                if gym_ids_socio_activos
+                else []
+            )
 
-    if empleado is not None:
-        raw_es_check = empleado.get("empleado_sucursal") or []
-        if not isinstance(raw_es_check, list):
-            raw_es_check = [raw_es_check] if raw_es_check else []
-        tiene_es_activa = any(
-            isinstance(es, dict) and es.get("estado") is not False and es.get("id_sucursal") is not None
-            for es in raw_es_check
-        )
-        if empleado.get("estado") is False or not tiene_es_activa:
-            perfiles_inactivos.add("empleado")
-        else:
-            perfiles_disponibles.append("empleado")
+        return {
+            "dueno": dueno,
+            "administrador": administrador,
+            "empleado": empleado,
+            "socio": socio,
+            "perfiles_disponibles": perfiles_disp,
+            "perfiles_inactivos": list(perfiles_inact),
+            "gyms_dueno": gyms_dueno,
+            "sucursales_dueno": sucursales_dueno,
+            "sucursales_admin": sucursales_admin,
+            "sucursales_socio": sucursales_socio,
+        }
 
-    if socio is not None:
-        if socio.get("estado") is False:
-            perfiles_inactivos.add("socio")
+    if cached_bundle is None:
+        if use_cache and cache_key:
+            async with _get_inflight_async_lock(cache_key):
+                cached_bundle = _get_cached_profile_bundle(cache_key)
+                if cached_bundle is None:
+                    cached_bundle = await _resolve_bundle()
+                    if store_cache:
+                        _set_cached_profile_bundle(cache_key, cached_bundle)
         else:
-            perfiles_disponibles.append("socio")
+            cached_bundle = await _resolve_bundle()
+            if store_cache and cache_key:
+                _set_cached_profile_bundle(cache_key, cached_bundle)
+
+    dueno = cached_bundle["dueno"]
+    administrador = cached_bundle["administrador"]
+    empleado = cached_bundle["empleado"]
+    socio = cached_bundle["socio"]
+    perfiles_disponibles = list(cached_bundle["perfiles_disponibles"])
+    perfiles_inactivos = set(cached_bundle["perfiles_inactivos"])
+    gyms_dueno_cached = cached_bundle["gyms_dueno"]
+    sucursales_dueno_cached = cached_bundle["sucursales_dueno"]
+    sucursales_admin_cached = cached_bundle["sucursales_admin"]
+    sucursales_socio_cached = cached_bundle["sucursales_socio"]
 
     # 3. Construir el mapa de gimnasios, sucursales y permisos por cada perfil activo
     contexto_por_perfil: Dict[str, Dict[str, Any]] = {}
 
     # 3.1. Perfil Dueño
     if "dueño" in perfiles_disponibles and dueno is not None:
-        gyms_dueno = _safe_query_list(
-            db,
-            "gimnasio",
-            "id_gimnasio, nombre, telefono, email, fecha_registro, estado, id_dueno",
-            eq_col="id_dueno",
-            eq_val=dueno["id_dueno"],
-            order_col="id_gimnasio",
-        )
-        gym_ids_dueno = [int(g["id_gimnasio"]) for g in gyms_dueno if g.get("id_gimnasio") is not None]
-        sucursales_dueno = _safe_query_list(
-            db,
-            "sucursal",
-            "id_sucursal, direccion, telefono, descripcion, fecha_registro, estado, id_gimnasio",
-            in_col="id_gimnasio",
-            in_vals=gym_ids_dueno,
-            order_col="id_sucursal",
-        ) if gym_ids_dueno else []
-
+        gym_ids_dueno = [int(g["id_gimnasio"]) for g in gyms_dueno_cached if g.get("id_gimnasio") is not None]
         contexto_por_perfil["dueño"] = {
-            "gimnasios": gyms_dueno,
+            "gimnasios": gyms_dueno_cached,
             "gym_ids": set(gym_ids_dueno),
-            "sucursales": sucursales_dueno,
-            "sucursal_ids": {int(s["id_sucursal"]) for s in sucursales_dueno if s.get("id_sucursal") is not None},
+            "sucursales": sucursales_dueno_cached,
+            "sucursal_ids": {int(s["id_sucursal"]) for s in sucursales_dueno_cached if s.get("id_sucursal") is not None},
             "permisos": ["*"],
             "roles_empleado": [],
             "roles_por_gimnasio": {},
@@ -419,20 +706,11 @@ async def resolver_contexto_negocio(
                     "estado_asignacion": ag.get("estado", True),
                 })
 
-        sucursales_admin = _safe_query_list(
-            db,
-            "sucursal",
-            "id_sucursal, direccion, telefono, descripcion, fecha_registro, estado, id_gimnasio",
-            in_col="id_gimnasio",
-            in_vals=gym_ids_admin,
-            order_col="id_sucursal",
-        ) if gym_ids_admin else []
-
         contexto_por_perfil["administrador"] = {
             "gimnasios": gyms_admin,
             "gym_ids": set(gym_ids_admin),
-            "sucursales": sucursales_admin,
-            "sucursal_ids": {int(s["id_sucursal"]) for s in sucursales_admin if s.get("id_sucursal") is not None},
+            "sucursales": sucursales_admin_cached,
+            "sucursal_ids": {int(s["id_sucursal"]) for s in sucursales_admin_cached if s.get("id_sucursal") is not None},
             "permisos": list(PERMISOS_ADMINISTRADOR_GIMNASIO),
             "roles_empleado": [],
             "roles_por_gimnasio": {},
@@ -549,15 +827,7 @@ async def resolver_contexto_negocio(
                 gyms_socio.append(gym_entry)
                 socio_gimnasio_por_gym[gid] = sg
 
-        sucursales_socio = _safe_query_list(
-            db,
-            "sucursal",
-            "id_sucursal, direccion, telefono, descripcion, fecha_registro, estado, id_gimnasio",
-            in_col="id_gimnasio",
-            in_vals=sorted(gym_ids_socio_activos),
-            order_col="id_sucursal",
-        ) if gym_ids_socio_activos else []
-        sucursales_socio = [s for s in sucursales_socio if s.get("estado") is not False]
+        sucursales_socio = [s for s in sucursales_socio_cached if s.get("estado") is not False]
 
         contexto_por_perfil["socio"] = {
             "gimnasios": gyms_socio,
@@ -816,12 +1086,17 @@ async def get_current_user(
     requested_sucursal_id = _extract_requested_sucursal_id(request)
     requested_role = _extract_requested_role(request)
 
+    is_get = request.method.upper() == "GET"
+    is_auth_me = request.url.path.rstrip("/").endswith("/auth/me")
+
     contexto = await resolver_contexto_negocio(
         db=db,
         auth_user=auth_user,
         requested_gym_id=requested_gym_id,
         requested_sucursal_id=requested_sucursal_id,
         requested_role=requested_role,
+        use_cache=is_get and not is_auth_me,
+        store_cache=is_get,
     )
     request.state.current_user = contexto
     return contexto

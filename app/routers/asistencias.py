@@ -7,6 +7,7 @@ from supabase import Client
 from app.core.dependencies import (
     get_current_user,
     _switch_profile_context_if_available,
+    run_db_parallel,
 )
 from app.services.utils import get_data
 from app.models.asistencia import (
@@ -350,13 +351,18 @@ async def get_estadisticas(
         else datetime(year_actual, mes_actual - 1, 1, tzinfo=timezone.utc).isoformat()
     )
 
-    res = (
-        db.from_("asistencia_socio")
-        .select(ASISTENCIA_SELECT)
-        .order("hora_ingreso", desc=True)
-        .execute()
+    [rows] = await run_db_parallel(
+        db,
+        staff_ctx.get("access_token"),
+        [
+            lambda c: get_data(
+                c.from_("asistencia_socio")
+                .select(ASISTENCIA_SELECT)
+                .order("hora_ingreso", desc=True)
+                .execute()
+            )
+        ],
     )
-    rows = get_data(res)
     scoped = _filter_asistencias_by_scope(
         rows if isinstance(rows, list) else [],
         gym_id=gym_id,
@@ -410,22 +416,29 @@ async def get_mis_asistencias(
     own_socio_id = int(socio_ctx["id_socio"])
     db: Client = socio_ctx["supabase"]
 
+    access_token = socio_ctx.get("access_token")
+
+    def _q_asoc_socio(c: Client):
+        return _fetch_socio_gimnasios_for_socio(c, own_socio_id)
+
+    def _q_mis_asist(c: Client):
+        return get_data(
+            c.from_("asistencia_socio")
+            .select(ASISTENCIA_SELECT)
+            .eq("id_socio", own_socio_id)
+            .order("hora_ingreso", desc=True)
+            .execute()
+        )
+
     if id_gimnasio is not None:
-        asocs = _fetch_socio_gimnasios_for_socio(db, own_socio_id)
+        asocs, rows = await run_db_parallel(db, access_token, [_q_asoc_socio, _q_mis_asist])
         if id_gimnasio not in {int(a["id_gimnasio"]) for a in asocs if a.get("id_gimnasio") is not None}:
             raise HTTPException(
                 status_code=status.HTTP_403_FORBIDDEN,
                 detail="No posees asociación con el gimnasio solicitado.",
             )
-
-    res = (
-        db.from_("asistencia_socio")
-        .select(ASISTENCIA_SELECT)
-        .eq("id_socio", own_socio_id)
-        .order("hora_ingreso", desc=True)
-        .execute()
-    )
-    rows = get_data(res)
+    else:
+        [rows] = await run_db_parallel(db, access_token, [_q_mis_asist])
     filtradas = _filter_asistencias_by_scope(
         rows if isinstance(rows, list) else [],
         gym_id=id_gimnasio,
@@ -543,13 +556,18 @@ async def get_asistencias(
         current_user, id_gimnasio=id_gimnasio, id_sucursal=id_sucursal
     )
     db: Client = staff_ctx["supabase"]
-    res = (
-        db.from_("asistencia_socio")
-        .select(ASISTENCIA_SELECT)
-        .order("hora_ingreso", desc=True)
-        .execute()
+    [rows] = await run_db_parallel(
+        db,
+        staff_ctx.get("access_token"),
+        [
+            lambda c: get_data(
+                c.from_("asistencia_socio")
+                .select(ASISTENCIA_SELECT)
+                .order("hora_ingreso", desc=True)
+                .execute()
+            )
+        ],
     )
-    rows = get_data(res)
     filtradas = _filter_asistencias_by_scope(
         rows if isinstance(rows, list) else [],
         gym_id=gym_id,
