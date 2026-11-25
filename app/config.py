@@ -282,7 +282,6 @@ def has_service_role() -> bool:
     return supabase_admin is not None
 
 
-<<<<<<< HEAD
 def create_supabase_anon_client() -> Client:
     """
     Crea un cliente público (`anon`) aislado para una operación puntual de Supabase Auth
@@ -296,7 +295,9 @@ def create_supabase_anon_client() -> Client:
         SUPABASE_URL,
         SUPABASE_ANON_KEY,
         options=_build_common_client_options(),
-=======
+    )
+
+
 def get_supabase_admin_client() -> Client:
     """
     Retorna el cliente administrativo de Supabase (`service_role` / `sb_secret_*`)
@@ -313,7 +314,6 @@ def get_supabase_admin_client() -> Client:
     raise RuntimeError(
         "Falta configurar la variable privada SUPABASE_SERVICE_ROLE_KEY en el servidor "
         "para gestionar integraciones privadas de pago."
->>>>>>> main
     )
 
 

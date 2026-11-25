@@ -34,6 +34,12 @@ SOCIO_GIMNASIO_SELECT = (
     "socio(id_socio, auth_user_id, dni, telefono, fecha_alta, estado, nombre, apellido, email), "
     "gimnasio(id_gimnasio, nombre, telefono, email, fecha_registro, estado, id_dueno)"
 )
+SOCIO_MEMBRESIA_SELECT = (
+    "id_membresia_socio, id_socio_gimnasio, id_membresia_gimnasio, id_gimnasio, "
+    "precio, duracion_dias_contratados, limite_asistencias_semanales, limite_asistencias_totales, "
+    "fecha_inicio, fecha_vencimiento, estado, creado_en, "
+    "membresia_gimnasio(id_membresia_gimnasio, nombre, descripcion, precio, duracion_dias, estado)"
+)
 
 
 def _clean_socio_dict(socio: Optional[Dict[str, Any]]) -> Dict[str, Any]:
@@ -218,10 +224,68 @@ def _parse_optional_bool_estado(estado: Optional[str]) -> Optional[bool]:
     )
 
 
-def _format_socio_con_asociacion(sg_row: Dict[str, Any]) -> Dict[str, Any]:
+def _sort_membresias_para_socio(membresias: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """Ordena las membresías priorizando activa > pendiente > vencida > cancelada y fecha de vencimiento descendente."""
+    prioridad = {"activa": 0, "activo": 0, "pendiente": 1, "vencida": 2, "vencido": 2, "cancelada": 3, "cancelado": 3}
+    ordenadas = sorted(
+        membresias,
+        key=lambda m: (str(m.get("fecha_vencimiento") or ""), int(m.get("id_membresia_socio") or 0)),
+        reverse=True,
+    )
+    ordenadas.sort(key=lambda m: prioridad.get(str(m.get("estado") or "").strip().lower(), 4))
+    return ordenadas
+
+
+def _fetch_membresias_por_socio_gimnasio(
+    db: Client,
+    id_gimnasio: int,
+    sg_ids: List[int],
+) -> Dict[int, List[Dict[str, Any]]]:
+    """Consulta las membresías (`public.membresia_socio`) de los `id_socio_gimnasio` indicados en el gimnasio."""
+    if not sg_ids:
+        return {}
+    try:
+        query = (
+            db.from_("membresia_socio")
+            .select(SOCIO_MEMBRESIA_SELECT)
+            .eq("id_gimnasio", id_gimnasio)
+        )
+        if len(sg_ids) == 1:
+            query = query.eq("id_socio_gimnasio", sg_ids[0])
+        else:
+            query = query.in_("id_socio_gimnasio", sg_ids)
+        res = query.order("fecha_vencimiento", desc=True).execute()
+        rows = get_data(res)
+    except Exception:
+        return {}
+
+    if not isinstance(rows, list):
+        return {}
+
+    allowed_sg = set(sg_ids)
+    agrupadas: Dict[int, List[Dict[str, Any]]] = {}
+    for m in rows:
+        if not isinstance(m, dict):
+            continue
+        if int(m.get("id_gimnasio") or 0) != id_gimnasio:
+            continue
+        sg_id = int(m.get("id_socio_gimnasio") or 0)
+        if sg_id not in allowed_sg:
+            continue
+        agrupadas.setdefault(sg_id, []).append(m)
+
+    return {sg_id: _sort_membresias_para_socio(lista) for sg_id, lista in agrupadas.items()}
+
+
+def _format_socio_con_asociacion(
+    sg_row: Dict[str, Any],
+    membresias: Optional[List[Dict[str, Any]]] = None,
+) -> Dict[str, Any]:
     socio_clean = _clean_socio_dict(sg_row.get("socio"))
     if not socio_clean and sg_row.get("id_socio") is not None:
         socio_clean = {"id_socio": sg_row.get("id_socio")}
+    membs_list = membresias if isinstance(membresias, list) else []
+    memb_actual = membs_list[0] if membs_list else None
     return {
         **socio_clean,
         "id_socio": socio_clean.get("id_socio") or sg_row.get("id_socio"),
@@ -231,6 +295,9 @@ def _format_socio_con_asociacion(sg_row: Dict[str, Any]) -> Dict[str, Any]:
         "fecha_alta_gimnasio": sg_row.get("fecha_alta"),
         "creado_en_asociacion": sg_row.get("creado_en"),
         "gimnasio": sg_row.get("gimnasio"),
+        "membresia": membs_list,
+        "membresias": membs_list,
+        "membresia_actual": memb_actual,
     }
 
 
@@ -612,7 +679,26 @@ async def get_socios(
         offset = (parsed_page - 1) * parsed_limit
         page_rows = filtradas[offset : offset + parsed_limit]
 
-    socios_formateados = [_format_socio_con_asociacion(sg) for sg in page_rows]
+    sg_ids_page = [
+        int(sg["id_socio_gimnasio"])
+        for sg in page_rows
+        if isinstance(sg, dict) and sg.get("id_socio_gimnasio") is not None
+    ]
+    membresias_por_sg: Dict[int, List[Dict[str, Any]]] = {}
+    if sg_ids_page:
+        [membresias_por_sg] = await run_db_parallel(
+            db,
+            staff_ctx.get("access_token"),
+            [lambda c: _fetch_membresias_por_socio_gimnasio(c, gym_id, sg_ids_page)],
+        )
+
+    socios_formateados = [
+        _format_socio_con_asociacion(
+            sg,
+            membresias_por_sg.get(int(sg.get("id_socio_gimnasio") or 0), []),
+        )
+        for sg in page_rows
+    ]
 
     return {
         "id_gimnasio": gym_id,
@@ -980,8 +1066,25 @@ async def get_socio_by_id(
         res_s = db.from_("socio").select(SOCIO_COLUMNS).eq("id_socio", id_socio).maybe_single().execute()
         socio_clean = _clean_socio_dict(get_data(res_s))
 
+    sg_id = assoc.get("id_socio_gimnasio")
+    membresias_socio: List[Dict[str, Any]] = []
+    if sg_id is not None:
+        membs_map = _fetch_membresias_por_socio_gimnasio(db, gym_id, [int(sg_id)])
+        membresias_socio = membs_map.get(int(sg_id), [])
+
+    membresia_actual = membresias_socio[0] if membresias_socio else None
+    socio_con_membresia = {
+        **socio_clean,
+        "id_socio_gimnasio": sg_id,
+        "estado_asociacion": assoc.get("estado"),
+        "fecha_alta_gimnasio": assoc.get("fecha_alta"),
+        "membresia": membresias_socio,
+        "membresias": membresias_socio,
+        "membresia_actual": membresia_actual,
+    }
+
     return {
-        "socio": socio_clean,
+        "socio": socio_con_membresia,
         "socio_gimnasio": {
             "id_socio_gimnasio": assoc.get("id_socio_gimnasio"),
             "id_socio": assoc.get("id_socio"),
@@ -991,6 +1094,8 @@ async def get_socio_by_id(
             "creado_en": assoc.get("creado_en"),
         },
         "gimnasio": assoc.get("gimnasio"),
+        "membresia_actual": membresia_actual,
+        "membresias": membresias_socio,
     }
 
 
