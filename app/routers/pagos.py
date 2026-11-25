@@ -1,4 +1,4 @@
-from datetime import datetime, timezone
+from datetime import date, datetime, timedelta, timezone
 from typing import Dict, Any, Optional, List
 from fastapi import APIRouter, HTTPException, status, Depends, Query, Path
 from supabase import Client
@@ -14,13 +14,12 @@ from app.routers.socios import (
 )
 from app.routers.membresias import (
     MEMBRESIA_SOCIO_SELECT,
-    _fetch_contratos_asociacion,
+    _cancelar_activas_y_calcular_dias_restantes,
     _fetch_membresia_or_404,
     _extract_socio_id_from_membresia,
     _map_rpc_error_status,
 )
 from app.services.membresia_lifecycle import (
-    buscar_conflicto_superposicion,
     enriquecer_membresia_ciclo_vida,
     parse_iso_date,
     seleccionar_membresia_vigente_y_programada,
@@ -430,33 +429,30 @@ async def registrar_pago(
             ),
         )
 
-    # Evitar que la aprobación del pago active una contratación pendiente superpuesta con otra vigente/programada
-    if (
+    # Al aprobarse el pago y cubrirse el contrato pendiente, reemplazar cualquier membresía activa previa
+    # y transferir sus días restantes de uso al vencimiento de la nueva contratación activada.
+    membresias_previas_canceladas: List[int] = []
+    dias_transferidos: int = 0
+    f_venc_c = parse_iso_date(contrato.get("fecha_vencimiento"))
+    va_a_activar_pendiente = (
         req.estado == "aprobado"
         and str(contrato.get("estado") or "").strip().lower() == "pendiente"
         and round(total_aprobado + monto_efectivo, 2) >= precio_contrato
-    ):
-        f_ini_c = parse_iso_date(contrato.get("fecha_inicio"))
-        f_venc_c = parse_iso_date(contrato.get("fecha_vencimiento"))
-        if f_ini_c is not None and f_venc_c is not None and contrato.get("id_socio_gimnasio") is not None:
-            contratos_asoc = _fetch_contratos_asociacion(
-                staff_db, int(contrato["id_socio_gimnasio"]), contrato_gym_id
-            )
-            conflicto = buscar_conflicto_superposicion(
-                contratos_asoc,
-                f_ini_c,
-                f_venc_c,
+    )
+    if va_a_activar_pendiente and contrato.get("id_socio_gimnasio") is not None:
+        try:
+            membresias_previas_canceladas, dias_transferidos = _cancelar_activas_y_calcular_dias_restantes(
+                staff_db,
+                contrato_gym_id,
+                int(contrato["id_socio_gimnasio"]),
                 excluir_id_membresia=req.id_membresia_socio,
+                hoy=date.today(),
             )
-            if conflicto is not None:
-                raise HTTPException(
-                    status_code=status.HTTP_409_CONFLICT,
-                    detail=(
-                        f"No se puede aprobar el pago y activar la contratación #{req.id_membresia_socio} "
-                        f"porque su período ({f_ini_c.isoformat()} a {f_venc_c.isoformat()}) se superpone con la contratación "
-                        f"#{conflicto.get('id_membresia_socio')} ({conflicto.get('fecha_inicio')} a {conflicto.get('fecha_vencimiento')})."
-                    ),
-                )
+        except Exception as exc:
+            raise HTTPException(
+                status_code=_map_rpc_error_status(exc),
+                detail=f"No fue posible reemplazar la membresía activa previa al aprobar el pago: {exc}",
+            ) from exc
 
     rpc_params = {
         "p_id_membresia_socio": req.id_membresia_socio,
@@ -476,9 +472,32 @@ async def registrar_pago(
             detail=f"No fue posible registrar el pago: {exc}",
         ) from exc
 
+    if va_a_activar_pendiente and dias_transferidos > 0 and f_venc_c is not None:
+        nueva_f_venc = (f_venc_c + timedelta(days=dias_transferidos)).isoformat()
+        try:
+            staff_db.rpc(
+                "rpc_actualizar_estado_membresia",
+                {
+                    "p_id_membresia_socio": req.id_membresia_socio,
+                    "p_estado": None,
+                    "p_fecha_vencimiento": nueva_f_venc,
+                },
+            ).execute()
+        except Exception as exc:
+            raise HTTPException(
+                status_code=_map_rpc_error_status(exc),
+                detail=f"El pago se registró pero no fue posible sumar los {dias_transferidos} días restantes anteriores: {exc}",
+            ) from exc
+
     return {
-        "mensaje": "Pago registrado con éxito.",
+        "mensaje": (
+            f"Pago registrado con éxito. Se canceló la membresía anterior y se sumaron {dias_transferidos} días restantes."
+            if dias_transferidos > 0
+            else "Pago registrado con éxito."
+        ),
         "pago": pago_creado,
+        "dias_transferidos": dias_transferidos,
+        "membresias_previas_canceladas": membresias_previas_canceladas,
     }
 
 
@@ -539,30 +558,53 @@ async def actualizar_estado_pago(
         )
 
     staff_db: Client = staff_ctx["supabase"]
-    if nuevo_estado == "aprobado":
-        ms_pago = pago_actual.get("membresia_socio") if isinstance(pago_actual.get("membresia_socio"), dict) else None
-        if ms_pago and str(ms_pago.get("estado") or "").strip().lower() == "pendiente":
-            f_ini_c = parse_iso_date(ms_pago.get("fecha_inicio"))
-            f_venc_c = parse_iso_date(ms_pago.get("fecha_vencimiento"))
-            if f_ini_c is not None and f_venc_c is not None and ms_pago.get("id_socio_gimnasio") is not None:
-                contratos_asoc = _fetch_contratos_asociacion(
-                    staff_db, int(ms_pago["id_socio_gimnasio"]), gym_id
-                )
-                conflicto = buscar_conflicto_superposicion(
-                    contratos_asoc,
-                    f_ini_c,
-                    f_venc_c,
-                    excluir_id_membresia=int(ms_pago["id_membresia_socio"]),
-                )
-                if conflicto is not None:
-                    raise HTTPException(
-                        status_code=status.HTTP_409_CONFLICT,
-                        detail=(
-                            f"No se puede aprobar el pago #{id_pago} porque activaría la contratación "
-                            f"#{ms_pago['id_membresia_socio']} en un período superpuesto con la contratación "
-                            f"#{conflicto.get('id_membresia_socio')} ({conflicto.get('fecha_inicio')} a {conflicto.get('fecha_vencimiento')})."
-                        ),
-                    )
+    membresias_previas_canceladas: List[int] = []
+    dias_transferidos: int = 0
+    ms_pago = pago_actual.get("membresia_socio") if isinstance(pago_actual.get("membresia_socio"), dict) else None
+    f_venc_c = parse_iso_date(ms_pago.get("fecha_vencimiento")) if ms_pago else None
+    va_a_activar_pendiente = False
+    if (
+        nuevo_estado == "aprobado"
+        and ms_pago is not None
+        and str(ms_pago.get("estado") or "").strip().lower() == "pendiente"
+        and ms_pago.get("id_socio_gimnasio") is not None
+        and ms_pago.get("id_membresia_socio") is not None
+    ):
+        precio_ms = round(float(ms_pago.get("precio") or 0), 2)
+        monto_este_pago = round(float(pago_actual.get("monto") or 0), 2)
+        res_otros_p = (
+            staff_db.from_("pago")
+            .select("id_pago, monto, estado")
+            .eq("id_membresia_socio", int(ms_pago["id_membresia_socio"]))
+            .execute()
+        )
+        otros_p = get_data(res_otros_p) or []
+        ya_aprobado = round(
+            sum(
+                float(p.get("monto") or 0)
+                for p in (otros_p if isinstance(otros_p, list) else [])
+                if isinstance(p, dict)
+                and int(p.get("id_pago") or 0) != id_pago
+                and str(p.get("estado") or "").strip().lower() == "aprobado"
+            ),
+            2,
+        )
+        va_a_activar_pendiente = round(ya_aprobado + monto_este_pago, 2) >= precio_ms
+
+    if va_a_activar_pendiente:
+        try:
+            membresias_previas_canceladas, dias_transferidos = _cancelar_activas_y_calcular_dias_restantes(
+                staff_db,
+                gym_id,
+                int(ms_pago["id_socio_gimnasio"]),
+                excluir_id_membresia=int(ms_pago["id_membresia_socio"]),
+                hoy=date.today(),
+            )
+        except Exception as exc:
+            raise HTTPException(
+                status_code=_map_rpc_error_status(exc),
+                detail=f"No fue posible reemplazar la membresía activa previa al aprobar el pago: {exc}",
+            ) from exc
 
     try:
         res_rpc = staff_db.rpc(
@@ -579,9 +621,32 @@ async def actualizar_estado_pago(
             detail=f"No fue posible actualizar el estado del pago: {exc}",
         ) from exc
 
+    if va_a_activar_pendiente and dias_transferidos > 0 and f_venc_c is not None:
+        nueva_f_venc = (f_venc_c + timedelta(days=dias_transferidos)).isoformat()
+        try:
+            staff_db.rpc(
+                "rpc_actualizar_estado_membresia",
+                {
+                    "p_id_membresia_socio": int(ms_pago["id_membresia_socio"]),
+                    "p_estado": None,
+                    "p_fecha_vencimiento": nueva_f_venc,
+                },
+            ).execute()
+        except Exception as exc:
+            raise HTTPException(
+                status_code=_map_rpc_error_status(exc),
+                detail=f"El pago se aprobó pero no fue posible sumar los {dias_transferidos} días restantes anteriores: {exc}",
+            ) from exc
+
     return {
-        "mensaje": "Estado del pago actualizado correctamente.",
+        "mensaje": (
+            f"Estado del pago actualizado correctamente. Se canceló la membresía anterior y se sumaron {dias_transferidos} días restantes."
+            if dias_transferidos > 0
+            else "Estado del pago actualizado correctamente."
+        ),
         "pago": pago_actualizado,
+        "dias_transferidos": dias_transferidos,
+        "membresias_previas_canceladas": membresias_previas_canceladas,
     }
 
 

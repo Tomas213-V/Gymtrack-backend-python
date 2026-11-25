@@ -575,27 +575,8 @@ async def solicitar_contratacion_pendiente(
             detail="No posees una asociación activa en el gimnasio de este plan.",
         )
 
-    from datetime import timedelta
-
     hoy = date.today()
-    sg_id = int(assoc["id_socio_gimnasio"])
-    duracion_plan = max(1, int(plan.get("duracion_dias") or 30))
-    contratos_previos = _fetch_contratos_asociacion(db, sg_id, plan_gym_id)
-    fecha_solicitada = parse_iso_date(req.fecha_inicio) or hoy
-    fecha_inicio_efectiva, _ = calcular_inicio_encadenado(contratos_previos, fecha_solicitada, hoy=hoy)
-    fecha_venc_efectiva = fecha_inicio_efectiva + timedelta(days=duracion_plan)
-
-    conflicto = buscar_conflicto_superposicion(
-        contratos_previos, fecha_inicio_efectiva, fecha_venc_efectiva, hoy=hoy
-    )
-    if conflicto is not None:
-        raise HTTPException(
-            status_code=status.HTTP_409_CONFLICT,
-            detail=(
-                f"La solicitud ({fecha_inicio_efectiva.isoformat()} a {fecha_venc_efectiva.isoformat()}) "
-                f"se superpone con tu contratación vigente/programada #{conflicto.get('id_membresia_socio')}."
-            ),
-        )
+    fecha_inicio_efectiva = parse_iso_date(req.fecha_inicio) or hoy
 
     try:
         res_rpc = db.rpc(

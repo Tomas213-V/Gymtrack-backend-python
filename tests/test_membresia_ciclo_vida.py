@@ -7,13 +7,15 @@ from tests import test_planes_membresias_pagos_b2_3 as b23
 
 class TestCicloVidaMembresias(unittest.TestCase):
     """
-    Pruebas específicas del ciclo de vida de membresías:
-      - Renovación anticipada encadenada al día siguiente y clasificada como `programada` (no `activa`).
-      - Solicitud `pendiente` encadenada automáticamente sin solapamiento.
-      - Bloqueo 409 si se intenta aprobar un pago o actualizar vencimiento generando solapamiento.
-      - Conservación de historial y pagos originales al renovar o cancelar.
-      - Conteo de socios únicos con plan activo en `/api/dashboard/admin`.
-      - Selección de membresía vigente hoy (y exposición separada de próxima programada) en `/api/socio/membresia` y `/api/socio/dashboard`.
+    Pruebas específicas del ciclo de vida de membresías (reemplazo inmediato con traspaso de días):
+      - Sin membresía programada: al contratar/renovar una membresía estando otra activa,
+        se cancela lógicamente la anterior (preservando historial y pagos) y sus días restantes
+        de uso se suman al vencimiento de la nueva membresía que inicia HOY.
+      - Ejemplo exacto del usuario: plan 30 días con 27 pasados (3 restantes) + nuevo plan 60 días ->
+        inicia HOY y vence en 63 días (`60 + 3`), anterior queda 'cancelada'.
+      - Solicitud `pendiente` inicia HOY sin cancelar todavía la activa; al aprobarse el pago
+        se cancela la anterior y se transfieren sus días restantes.
+      - Conteo de socios únicos con plan activo en `/api/dashboard/admin` y `membresia_programada = None`.
     """
 
     @classmethod
@@ -31,83 +33,128 @@ class TestCicloVidaMembresias(unittest.TestCase):
     def _patch_env(self, **kwargs):
         return self.fixture._patch_env(**kwargs)
 
-    def test_01_renovacion_anticipada_es_programada_y_preserva_historial_y_dias(self):
+    def test_01_contratar_nueva_cancela_anterior_y_suma_dias_restantes_exactos(self):
         token_recep = self._make_token(self.uid_recep_1, "recep1@gymtrack.test")
         p1, p2, fake_db, _ = self._patch_env()
         with p1, p2:
-            # Socio 70 tiene contrato 801 activo (inició hace 5 días, vence en 25 días)
-            contrato_801_antes = copy.deepcopy(
-                next(m for m in fake_db.state["membresia_socio"] if m["id_membresia_socio"] == 801)
+            hoy = date.today()
+            # Configurar el ejemplo exacto: plan 30 días donde ya pasaron 27 -> quedan 3 días
+            contrato_801 = next(m for m in fake_db.state["membresia_socio"] if m["id_membresia_socio"] == 801)
+            contrato_801["fecha_inicio"] = (hoy - timedelta(days=27)).isoformat()
+            contrato_801["fecha_vencimiento"] = (hoy + timedelta(days=3)).isoformat()
+            contrato_801["estado"] = "activa"
+
+            # Agregar plan de 2 meses (60 días) en Gym 10
+            fake_db.state["membresia_gimnasio"].append(
+                {
+                    "id_membresia_gimnasio": 599,
+                    "nombre": "Plan Bimestral 60d",
+                    "descripcion": "2 meses",
+                    "precio": 55000.0,
+                    "duracion_dias": 60,
+                    "limite_asistencias_semanales": None,
+                    "limite_asistencias_totales": None,
+                    "estado": True,
+                    "id_gimnasio": 10,
+                }
             )
-            venc_801 = date.fromisoformat(contrato_801_antes["fecha_vencimiento"])
 
             res = self.client.post(
                 "/api/membresias/renovar",
                 json={
                     "id_socio": 70,
-                    "id_membresia_gimnasio": 501,
+                    "id_membresia_gimnasio": 599,
                     "estado": "activa",
                     "registrar_pago": True,
                     "metodo_pago": "efectivo",
-                    "comprobante": "REN-PROG-70",
+                    "comprobante": "REN-60D-MAS-3D",
                 },
                 headers={"Authorization": f"Bearer {token_recep}"},
             )
-            self.assertEqual(res.status_code, 201)
-            nueva = res.json()["membresia_socio"]
+            self.assertEqual(res.status_code, 201, res.text)
+            body = res.json()
+            nueva = body["membresia_socio"]
 
-            # Debe iniciar el día siguiente al vencimiento de 801 y figurar como PROGRAMADA (no ACTIVA)
-            self.assertEqual(nueva["fecha_inicio"], (venc_801 + timedelta(days=1)).isoformat())
-            self.assertEqual(nueva["fecha_vencimiento"], (venc_801 + timedelta(days=31)).isoformat())
-            self.assertEqual(nueva["estado"], "programada")
-            self.assertEqual(nueva["estado_efectivo"], "programada")
-            self.assertTrue(nueva["es_programada"])
-            self.assertFalse(nueva["es_vigente"])
+            # Inicia HOY, activa de inmediato (sin programada), y vence en 60 + 3 = 63 días
+            self.assertEqual(nueva["fecha_inicio"], hoy.isoformat())
+            self.assertEqual(nueva["fecha_vencimiento"], (hoy + timedelta(days=63)).isoformat())
+            self.assertEqual(nueva["estado"], "activa")
+            self.assertEqual(nueva["estado_efectivo"], "activa")
+            self.assertFalse(nueva["es_programada"])
+            self.assertTrue(nueva["es_vigente"])
+            self.assertEqual(body["dias_transferidos"], 3)
+            self.assertEqual(body["membresias_previas_canceladas"], [801])
 
-            # Contrato anterior 801 intacto (historial preservado)
+            # Contrato anterior 801 cancelado lógicamente (fila histórica y condiciones originales preservadas)
             contrato_801_despues = next(
                 m for m in fake_db.state["membresia_socio"] if m["id_membresia_socio"] == 801
             )
-            self.assertEqual(contrato_801_despues, contrato_801_antes)
-
-            # En GET /api/membresias: 801 sigue 'activa' y la renovación aparece 'programada'
-            r_list = self.client.get(
-                "/api/membresias?id_socio=70",
-                headers={"Authorization": f"Bearer {token_recep}"},
-            )
-            self.assertEqual(r_list.status_code, 200)
-            by_id = {m["id_membresia_socio"]: m for m in r_list.json()["membresias"]}
-            self.assertEqual(by_id[801]["estado"], "activa")
-            self.assertEqual(by_id[nueva["id_membresia_socio"]]["estado"], "programada")
+            self.assertEqual(contrato_801_despues["estado"], "cancelada")
+            self.assertEqual(contrato_801_despues["fecha_inicio"], (hoy - timedelta(days=27)).isoformat())
+            self.assertEqual(contrato_801_despues["precio"], 30000.0)
 
             # Pago de la renovación asociado exclusivamente a la nueva contratación
-            pago_nuevo = res.json()["pago"]
+            pago_nuevo = body["pago"]
             self.assertEqual(pago_nuevo["id_membresia_socio"], nueva["id_membresia_socio"])
 
-    def test_02_solicitud_pendiente_con_activa_se_encadena_y_bloquea_solapamiento_al_pagar(self):
+    def test_02_solicitud_pendiente_no_cancela_activa_hasta_aprobar_pago_y_suma_dias(self):
         token_dueno1 = self._make_token(self.uid_dueno_1, "dueno1@gymtrack.test")
         token_socio70 = self._make_token(self.uid_socio_70, "socio70@gymtrack.test")
         p1, p2, fake_db, _ = self._patch_env()
         with p1, p2:
-            venc_801 = date.fromisoformat(
-                next(m for m in fake_db.state["membresia_socio"] if m["id_membresia_socio"] == 801)["fecha_vencimiento"]
-            )
+            hoy = date.today()
+            contrato_801 = next(m for m in fake_db.state["membresia_socio"] if m["id_membresia_socio"] == 801)
+            contrato_801["fecha_inicio"] = (hoy - timedelta(days=25)).isoformat()
+            contrato_801["fecha_vencimiento"] = (hoy + timedelta(days=5)).isoformat()
 
-            # 1. Socio 70 solicita renovación pendiente enviando fecha de hoy -> backend la encadena a venc_801 + 1
+            # 1. Socio 70 solicita nuevo plan pendiente -> inicia HOY, y 801 sigue activa mientras no se pague
             r_sol = self.client.post(
                 "/api/socio/membresia/solicitar",
-                json={"id_membresia_gimnasio": 501, "fecha_inicio": date.today().isoformat()},
+                json={"id_membresia_gimnasio": 501, "fecha_inicio": hoy.isoformat()},
                 headers={"Authorization": f"Bearer {token_socio70}"},
             )
-            self.assertEqual(r_sol.status_code, 201)
+            self.assertEqual(r_sol.status_code, 201, r_sol.text)
             sol = r_sol.json()["membresia_socio"]
             self.assertEqual(sol["estado"], "pendiente")
-            self.assertEqual(sol["fecha_inicio"], (venc_801 + timedelta(days=1)).isoformat())
+            self.assertEqual(sol["fecha_inicio"], hoy.isoformat())
+            self.assertEqual(contrato_801["estado"], "activa")
 
-            # 2. Simular un contrato pendiente heredado con fechas SUPERPUESTAS (el bug observado en producción)
+            # 2. Al aprobar el pago de la solicitud pendiente -> cancela 801 y suma sus 5 días restantes (30 + 5 = 35)
+            r_pago = self.client.post(
+                "/api/pagos",
+                json={
+                    "id_membresia_socio": sol["id_membresia_socio"],
+                    "metodo_pago": "efectivo",
+                    "estado": "aprobado",
+                    "comprobante": "APROB-TRASPASO-5D",
+                },
+                headers={"Authorization": f"Bearer {token_dueno1}"},
+            )
+            self.assertEqual(r_pago.status_code, 201, r_pago.text)
+            self.assertEqual(r_pago.json()["dias_transferidos"], 5)
+            self.assertEqual(r_pago.json()["membresias_previas_canceladas"], [801])
+
+            contrato_801_post = next(m for m in fake_db.state["membresia_socio"] if m["id_membresia_socio"] == 801)
+            sol_post = next(
+                m for m in fake_db.state["membresia_socio"] if m["id_membresia_socio"] == sol["id_membresia_socio"]
+            )
+            self.assertEqual(contrato_801_post["estado"], "cancelada")
+            self.assertEqual(sol_post["estado"], "activa")
+            self.assertEqual(sol_post["fecha_vencimiento"], (hoy + timedelta(days=35)).isoformat())
+
+    def test_03_patch_activa_reemplaza_y_rechaza_activar_contrato_vencido(self):
+        token_dueno1 = self._make_token(self.uid_dueno_1, "dueno1@gymtrack.test")
+        p1, p2, fake_db, _ = self._patch_env()
+        with p1, p2:
+            hoy = date.today()
+            # Simular contrato pendiente nuevo para Socio 70 mientras 801 tiene 4 días restantes
+            contrato_801 = next(m for m in fake_db.state["membresia_socio"] if m["id_membresia_socio"] == 801)
+            contrato_801["fecha_inicio"] = (hoy - timedelta(days=26)).isoformat()
+            contrato_801["fecha_vencimiento"] = (hoy + timedelta(days=4)).isoformat()
+
             fake_db.state["membresia_socio"].append(
                 {
-                    "id_membresia_socio": 899,
+                    "id_membresia_socio": 890,
                     "id_socio_gimnasio": 701,
                     "id_membresia_gimnasio": 501,
                     "id_gimnasio": 10,
@@ -115,46 +162,22 @@ class TestCicloVidaMembresias(unittest.TestCase):
                     "duracion_dias_contratados": 30,
                     "limite_asistencias_semanales": None,
                     "limite_asistencias_totales": None,
-                    "fecha_inicio": date.today().isoformat(),
-                    "fecha_vencimiento": (date.today() + timedelta(days=30)).isoformat(),
+                    "fecha_inicio": hoy.isoformat(),
+                    "fecha_vencimiento": (hoy + timedelta(days=30)).isoformat(),
                     "estado": "pendiente",
                     "creado_en": "2026-11-25T10:00:00Z",
                 }
             )
-            # Intentar registrar un pago aprobado sobre 899 (superpuesta con 801) -> 409 Conflict
-            r_pago_overlap = self.client.post(
-                "/api/pagos",
-                json={
-                    "id_membresia_socio": 899,
-                    "metodo_pago": "efectivo",
-                    "estado": "aprobado",
-                    "comprobante": "OVERLAP-899",
-                },
+            # Activar 890 con pago automático -> cancela 801 y extiende vencimiento a hoy + 34 días
+            r_act = self.client.patch(
+                "/api/membresias/890",
+                json={"estado": "activa", "registrar_pago_si_falta": True},
                 headers={"Authorization": f"Bearer {token_dueno1}"},
             )
-            self.assertEqual(r_pago_overlap.status_code, 409)
-
-    def test_03_patch_no_permite_extender_vencimiento_superponiendo_renovacion_programada(self):
-        token_dueno1 = self._make_token(self.uid_dueno_1, "dueno1@gymtrack.test")
-        p1, p2, fake_db, _ = self._patch_env()
-        with p1, p2:
-            # Crear renovación programada encadenada para Socio 70
-            r_ren = self.client.post(
-                "/api/membresias/renovar",
-                json={"id_socio": 70, "id_membresia_gimnasio": 501, "estado": "activa"},
-                headers={"Authorization": f"Bearer {token_dueno1}"},
-            )
-            self.assertEqual(r_ren.status_code, 201)
-            prog = r_ren.json()["membresia_socio"]
-            inicio_prog = date.fromisoformat(prog["fecha_inicio"])
-
-            # Intentar extender contrato 801 invadiendo la fecha de inicio de la renovación programada -> 409
-            r_ext = self.client.patch(
-                "/api/membresias/801",
-                json={"fecha_vencimiento": (inicio_prog + timedelta(days=5)).isoformat()},
-                headers={"Authorization": f"Bearer {token_dueno1}"},
-            )
-            self.assertEqual(r_ext.status_code, 409)
+            self.assertEqual(r_act.status_code, 200, r_act.text)
+            self.assertEqual(r_act.json()["dias_transferidos"], 4)
+            self.assertEqual(r_act.json()["membresias_previas_canceladas"], [801])
+            self.assertEqual(r_act.json()["membresia_socio"]["fecha_vencimiento"], (hoy + timedelta(days=34)).isoformat())
 
             # Intentar marcar como 'activa' un contrato ya vencido (802 de Socio 71) -> 400
             r_venc = self.client.patch(
@@ -164,41 +187,32 @@ class TestCicloVidaMembresias(unittest.TestCase):
             )
             self.assertEqual(r_venc.status_code, 400)
 
-    def test_04_dashboard_admin_cuenta_socios_unicos_y_socio_ve_vigente_hoy_mas_programada(self):
+    def test_04_dashboard_admin_y_socio_sin_programadas_y_contrato_futuro_heredado_solo_transfiere_dias_pagados(self):
         token_dueno1 = self._make_token(self.uid_dueno_1, "dueno1@gymtrack.test")
         token_socio70 = self._make_token(self.uid_socio_70, "socio70@gymtrack.test")
         p1, p2, fake_db, _ = self._patch_env()
         with p1, p2:
-            # Renovación anticipada para Socio 70 (crea fila programada) + fila heredada duplicada para Socio 70
-            self.client.post(
+            hoy = date.today()
+            # Simular un contrato heredado futuro (como #10: 2027-11-26 a 2027-12-26 -> 30 días reales)
+            contrato_801 = next(m for m in fake_db.state["membresia_socio"] if m["id_membresia_socio"] == 801)
+            contrato_801["fecha_inicio"] = (hoy + timedelta(days=366)).isoformat()
+            contrato_801["fecha_vencimiento"] = (hoy + timedelta(days=396)).isoformat()
+
+            # Al contratar nueva de 30 días, cancela la futura heredada y suma exactamente sus 30 días (no 396)
+            r_ren = self.client.post(
                 "/api/membresias/renovar",
                 json={"id_socio": 70, "id_membresia_gimnasio": 501, "estado": "activa"},
                 headers={"Authorization": f"Bearer {token_dueno1}"},
             )
-            # Simular incluso 2 filas activas solapadas heredadas del mismo Socio 70 (como el caso reportado)
-            fake_db.state["membresia_socio"].append(
-                {
-                    "id_membresia_socio": 898,
-                    "id_socio_gimnasio": 701,
-                    "id_membresia_gimnasio": 501,
-                    "id_gimnasio": 10,
-                    "precio": 30000.0,
-                    "duracion_dias_contratados": 90,
-                    "limite_asistencias_semanales": None,
-                    "limite_asistencias_totales": None,
-                    "fecha_inicio": (date.today() - timedelta(days=1)).isoformat(),
-                    "fecha_vencimiento": (date.today() + timedelta(days=89)).isoformat(),
-                    "estado": "activa",
-                    "creado_en": "2026-11-24T10:00:00Z",
-                }
-            )
-            # Agregar tablas mínimas para dashboard_admin
+            self.assertEqual(r_ren.status_code, 201, r_ren.text)
+            self.assertEqual(r_ren.json()["dias_transferidos"], 30)
+            self.assertEqual(r_ren.json()["membresia_socio"]["fecha_inicio"], hoy.isoformat())
+            self.assertEqual(r_ren.json()["membresia_socio"]["fecha_vencimiento"], (hoy + timedelta(days=60)).isoformat())
+
             fake_db.state.setdefault("asistencia_socio", [])
             fake_db.state.setdefault("rutina_gimnasio", [])
             fake_db.state.setdefault("rutinas_asignadas_socio_gimnasio", [])
 
-            # Dashboard admin: aunque Socio 70 tenga 2 filas 'activa' heredadas + 1 'programada',
-            # "Socios con plan activo" DEBE ser 1 (único socio_gimnasio 701), no 3!
             r_dash = self.client.get(
                 "/api/dashboard/admin",
                 headers={"Authorization": f"Bearer {token_dueno1}"},
@@ -207,10 +221,8 @@ class TestCicloVidaMembresias(unittest.TestCase):
             kpis_m = r_dash.json()["kpis"]["membresias"]
             self.assertEqual(kpis_m["activas"], 1)
             self.assertEqual(kpis_m["sociosConPlanActivo"], 1)
-            self.assertEqual(kpis_m["programadas"], 1)
+            self.assertEqual(kpis_m["programadas"], 0)
 
-            # Panel del socio (/api/socio/membresia): muestra la vigente HOY como principal
-            # y la renovación futura aparte en `membresia_programada` (no confunde futura con actual)
             r_sm = self.client.get(
                 "/api/socio/membresia",
                 headers={"Authorization": f"Bearer {token_socio70}"},
@@ -218,8 +230,7 @@ class TestCicloVidaMembresias(unittest.TestCase):
             self.assertEqual(r_sm.status_code, 200)
             sm_body = r_sm.json()
             self.assertEqual(sm_body["membresia"]["estado"], "activa")
-            self.assertIsNotNone(sm_body["membresia_programada"])
-            self.assertEqual(sm_body["membresia_programada"]["estado"], "programada")
+            self.assertIsNone(sm_body["membresia_programada"])
 
 
 if __name__ == "__main__":

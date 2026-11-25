@@ -694,9 +694,40 @@ async def registrar_asistencia(
         ).execute()
         nueva = get_data(res_rpc)
     except Exception as exc:
+        err_msg = str(getattr(exc, "message", None) or str(exc) or "").strip()
+        detalle_extra = ""
+        if "membresía activa y vigente" in err_msg.lower() or "membresia activa y vigente" in err_msg.lower():
+            try:
+                res_sg_diag = (
+                    actor_db.from_("socio_gimnasio")
+                    .select("id_socio_gimnasio, estado")
+                    .eq("id_socio", int(target_socio_id))
+                    .eq("id_gimnasio", sucursal_gym_id)
+                    .maybe_single()
+                    .execute()
+                )
+                sg_diag = get_data(res_sg_diag)
+                if isinstance(sg_diag, dict) and sg_diag.get("id_socio_gimnasio") is not None:
+                    res_m_diag = (
+                        actor_db.from_("membresia_socio")
+                        .select("id_membresia_socio, estado, fecha_inicio, fecha_vencimiento")
+                        .eq("id_socio_gimnasio", int(sg_diag["id_socio_gimnasio"]))
+                        .eq("id_gimnasio", sucursal_gym_id)
+                        .order("fecha_vencimiento", desc=True)
+                        .execute()
+                    )
+                    m_diag_rows = get_data(res_m_diag) or []
+                    if isinstance(m_diag_rows, list) and m_diag_rows:
+                        ult = m_diag_rows[0]
+                        detalle_extra = (
+                            f" (Última contratación #{ult.get('id_membresia_socio')}: estado='{ult.get('estado')}', "
+                            f"vigencia={ult.get('fecha_inicio')} a {ult.get('fecha_vencimiento')})"
+                        )
+            except Exception:
+                detalle_extra = ""
         raise HTTPException(
             status_code=_map_asistencia_rpc_error(exc),
-            detail=f"No fue posible registrar el ingreso: {exc}",
+            detail=f"No fue posible registrar el ingreso: {err_msg}{detalle_extra}",
         ) from exc
 
     return {

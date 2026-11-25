@@ -1150,15 +1150,17 @@ class TestPlanesMembresiasPagosB23(unittest.TestCase):
             ids_socio71 = {m["id_membresia_socio"] for m in res_socio.json()["membresias"]}
             self.assertEqual(ids_socio71, {802, 803})
 
-    # 10. Renovar antes del vencimiento conservando días restantes
+    # 10. Renovar antes del vencimiento cancelando la anterior y sumando días restantes
     def test_10_renovar_antes_del_vencimiento_conserva_dias_restantes(self):
         token_recep = self._make_token(self.uid_recep_1, "recep1@gymtrack.test")
         p1, p2, fake_db, _ = self._patch_env()
         with p1, p2:
+            hoy = date.today()
             prev_801 = copy.deepcopy(
                 next(m for m in fake_db.state["membresia_socio"] if m["id_membresia_socio"] == 801)
             )
             venc_anterior = date.fromisoformat(prev_801["fecha_vencimiento"])
+            dias_restantes = max(0, (venc_anterior - hoy).days)
 
             res = self.client.post(
                 "/api/membresias/renovar",
@@ -1174,11 +1176,13 @@ class TestPlanesMembresiasPagosB23(unittest.TestCase):
             )
             self.assertEqual(res.status_code, 201)
             nueva = res.json()["membresia_socio"]
-            expected_inicio = venc_anterior + timedelta(days=1)
-            expected_venc = expected_inicio + timedelta(days=30)
-            self.assertEqual(nueva["fecha_inicio"], expected_inicio.isoformat())
-            self.assertEqual(nueva["fecha_vencimiento"], expected_venc.isoformat())
+            self.assertEqual(nueva["fecha_inicio"], hoy.isoformat())
+            self.assertEqual(nueva["fecha_vencimiento"], (hoy + timedelta(days=30 + dias_restantes)).isoformat())
+            self.assertEqual(nueva["estado"], "activa")
+            self.assertEqual(res.json()["dias_transferidos"], dias_restantes)
             self.assertNotEqual(nueva["id_membresia_socio"], 801)
+            post_801 = next(m for m in fake_db.state["membresia_socio"] if m["id_membresia_socio"] == 801)
+            self.assertEqual(post_801["estado"], "cancelada")
 
     # 11. Renovar después del vencimiento iniciando desde la fecha actual
     def test_11_renovar_despues_del_vencimiento_inicia_hoy(self):
@@ -1220,7 +1224,10 @@ class TestPlanesMembresiasPagosB23(unittest.TestCase):
             self.assertEqual(len(fake_db.state["membresia_socio"]), total_antes + 1)
 
             actual_801 = next(m for m in fake_db.state["membresia_socio"] if m["id_membresia_socio"] == 801)
-            self.assertEqual(actual_801, snapshot_801)
+            # La fila anterior se cancela lógicamente al activarse la nueva, conservando todas sus condiciones históricas intactas
+            self.assertEqual(actual_801["estado"], "cancelada")
+            for campo_inmutable in ("id_membresia_socio", "id_socio_gimnasio", "id_membresia_gimnasio", "precio", "fecha_inicio", "fecha_vencimiento"):
+                self.assertEqual(actual_801[campo_inmutable], snapshot_801[campo_inmutable])
 
             # Intentar mutar precio o fecha_inicio de una contratación histórica -> 403
             res_mut = self.client.patch(
@@ -1230,9 +1237,10 @@ class TestPlanesMembresiasPagosB23(unittest.TestCase):
             )
             self.assertEqual(res_mut.status_code, 403)
 
-            # Cancelación vía DELETE es lógica (rpc_actualizar_estado_membresia) y no elimina la fila
+            # Cancelación vía DELETE sobre la nueva contratación es lógica (rpc_actualizar_estado_membresia) y no elimina la fila
+            nuevo_id = res_ren.json()["membresia_socio"]["id_membresia_socio"]
             res_cancel = self.client.delete(
-                "/api/membresias/801",
+                f"/api/membresias/{nuevo_id}",
                 headers={"Authorization": f"Bearer {token_dueno1}"},
             )
             self.assertEqual(res_cancel.status_code, 200)

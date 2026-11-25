@@ -222,14 +222,6 @@ def calcular_metricas_membresia(membresia: Optional[Dict[str, Any]]) -> Dict[str
         estado_etiqueta = "Vencida"
         tiempo_restante_texto = f"Vencida hace {abs(dias_restantes)} días" if dias_restantes < 0 else "Vencida"
         porcentaje_transcurrido = 100
-    elif es_futura or est_raw in ("programada", "programado"):
-        estado_clave = "programada"
-        estado_etiqueta = "Programada"
-        dias_para_inicio = max(1, (f_ini - hoy).days)
-        tiempo_restante_texto = (
-            "Inicia mañana" if dias_para_inicio == 1 else f"Inicia en {dias_para_inicio} días"
-        )
-        porcentaje_transcurrido = 0
     else:
         estado_clave = "activa"
         estado_etiqueta = "Activa"
@@ -239,9 +231,9 @@ def calcular_metricas_membresia(membresia: Optional[Dict[str, Any]]) -> Dict[str
             tiempo_restante_texto = f"{dias_restantes} días"
 
     return {
-        "tiene_membresia": estado_clave in ("activa", "programada", "pendiente"),
-        "es_vigente": estado_clave == "activa",
-        "es_programada": estado_clave == "programada",
+        "tiene_membresia": estado_clave in ("activa", "pendiente"),
+        "es_vigente": estado_clave == "activa" and not es_futura,
+        "es_programada": False,
         "estado_clave": estado_clave,
         "estado_etiqueta": estado_etiqueta,
         "dias_restantes": max(0, dias_restantes),
