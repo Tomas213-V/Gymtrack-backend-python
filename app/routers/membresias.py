@@ -1,10 +1,19 @@
-from datetime import date
+from datetime import date, timedelta
 from typing import Dict, Any, Optional, List
 from fastapi import APIRouter, HTTPException, status, Depends, Query, Path
 from supabase import Client
 
 from app.core.dependencies import get_current_user, run_db_parallel
 from app.services.utils import get_data
+from app.services.membresia_lifecycle import (
+    ESTADOS_MEMBRESIA_EFECTIVOS,
+    ESTADOS_VIGENCIA_BLOQUEANTES,
+    buscar_conflicto_superposicion,
+    calcular_estado_efectivo_membresia,
+    calcular_inicio_encadenado,
+    enriquecer_membresia_ciclo_vida,
+    parse_iso_date,
+)
 from app.models.membresia import (
     MembresiaCreate,
     MembresiaRenovarRequest,
@@ -30,7 +39,30 @@ MEMBRESIA_SOCIO_SELECT = (
     "membresia_gimnasio(id_membresia_gimnasio, nombre, descripcion, precio, duracion_dias, estado, id_gimnasio)"
 )
 
-ESTADOS_MEMBRESIA_VALIDOS = {"pendiente", "activa", "vencida", "cancelada"}
+ESTADOS_MEMBRESIA_VALIDOS = ESTADOS_MEMBRESIA_EFECTIVOS
+
+
+def _fetch_contratos_asociacion(
+    db: Client,
+    id_socio_gimnasio: int,
+    id_gimnasio: int,
+) -> List[Dict[str, Any]]:
+    res = (
+        db.from_("membresia_socio")
+        .select("id_membresia_socio, id_socio_gimnasio, id_gimnasio, fecha_inicio, fecha_vencimiento, estado")
+        .eq("id_socio_gimnasio", id_socio_gimnasio)
+        .eq("id_gimnasio", id_gimnasio)
+        .execute()
+    )
+    rows = get_data(res)
+    if not isinstance(rows, list):
+        return []
+    return [
+        r for r in rows
+        if isinstance(r, dict)
+        and int(r.get("id_socio_gimnasio") or 0) == int(id_socio_gimnasio)
+        and int(r.get("id_gimnasio") or 0) == int(id_gimnasio)
+    ]
 
 
 def _map_rpc_error_status(exc: Exception) -> int:
@@ -116,15 +148,19 @@ async def get_mis_membresias(
     if estado_norm and estado_norm not in ESTADOS_MEMBRESIA_VALIDOS:
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
-            detail="Estado de membresía inválido. Permitidos: pendiente, activa, vencida, cancelada.",
+            detail="Estado de membresía inválido. Permitidos: pendiente, programada, activa, vencida, cancelada.",
         )
 
-    membresias = [
-        m for m in (rows if isinstance(rows, list) else [])
-        if isinstance(m, dict)
-        and int(m.get("id_socio_gimnasio") or 0) in set(target_sg_ids)
-        and (estado_norm is None or str(m.get("estado") or "").lower() == estado_norm)
-    ]
+    hoy = date.today()
+    membresias = []
+    for m in (rows if isinstance(rows, list) else []):
+        if not isinstance(m, dict) or int(m.get("id_socio_gimnasio") or 0) not in set(target_sg_ids):
+            continue
+        enr = enriquecer_membresia_ciclo_vida(m, hoy=hoy)
+        if estado_norm is not None and enr["estado_efectivo"] != estado_norm:
+            continue
+        membresias.append(enr)
+
     return {
         "id_socio": own_socio_id,
         "total": len(membresias),
@@ -158,7 +194,7 @@ async def get_membresias(
     if estado_norm and estado_norm not in ESTADOS_MEMBRESIA_VALIDOS:
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
-            detail="Estado de membresía inválido. Permitidos: pendiente, activa, vencida, cancelada.",
+            detail="Estado de membresía inválido. Permitidos: pendiente, programada, activa, vencida, cancelada.",
         )
 
     db: Client = staff_ctx["supabase"]
@@ -175,19 +211,25 @@ async def get_membresias(
             )
         ],
     )
+    hoy = date.today()
     membresias: List[Dict[str, Any]] = []
+    socios_activos_set = set()
     for m in (rows if isinstance(rows, list) else []):
         if not isinstance(m, dict) or int(m.get("id_gimnasio") or 0) != gym_id:
             continue
         if id_socio is not None and _extract_socio_id_from_membresia(m) != id_socio:
             continue
-        if estado_norm and str(m.get("estado") or "").lower() != estado_norm:
+        enr = enriquecer_membresia_ciclo_vida(m, hoy=hoy)
+        if enr["estado_efectivo"] == "activa" and enr.get("id_socio_gimnasio") is not None:
+            socios_activos_set.add(int(enr["id_socio_gimnasio"]))
+        if estado_norm and enr["estado_efectivo"] != estado_norm:
             continue
-        membresias.append(m)
+        membresias.append(enr)
 
     return {
         "id_gimnasio": gym_id,
         "total": len(membresias),
+        "socios_con_plan_activo": len(socios_activos_set),
         "membresias": membresias,
     }
 
@@ -330,11 +372,42 @@ async def _contratar_o_renovar_logic(
             detail="El socio no posee una asociación socio_gimnasio activa en este gimnasio.",
         )
 
+    # Normalizar estado inicial en backend (el cliente nunca impone un estado incoherente con el pago)
+    estado_rpc = "pendiente" if (estado == "pendiente" or (registrar_pago and estado_pago != "aprobado")) else "activa"
+
+    # Encadenamiento y validación anti-solapamiento en backend (aplica tanto a 'activa' como a 'pendiente')
+    hoy = date.today()
+    sg_id = int(assoc["id_socio_gimnasio"])
+    duracion_plan = max(1, int(plan.get("duracion_dias") or 30))
+    contratos_previos = _fetch_contratos_asociacion(actor_db, sg_id, plan_gym_id)
+
+    fecha_solicitada = parse_iso_date(fecha_inicio) or hoy
+    fecha_inicio_efectiva, _max_venc = calcular_inicio_encadenado(
+        contratos_previos, fecha_solicitada, hoy=hoy
+    )
+    fecha_venc_efectiva = fecha_inicio_efectiva + timedelta(days=duracion_plan)
+
+    conflicto = buscar_conflicto_superposicion(
+        contratos_previos,
+        fecha_inicio_efectiva,
+        fecha_venc_efectiva,
+        hoy=hoy,
+    )
+    if conflicto is not None:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail=(
+                f"El período calculado ({fecha_inicio_efectiva.isoformat()} a {fecha_venc_efectiva.isoformat()}) "
+                f"se superpone con la contratación vigente/programada #{conflicto.get('id_membresia_socio')} "
+                f"({conflicto.get('fecha_inicio')} a {conflicto.get('fecha_vencimiento')})."
+            ),
+        )
+
     rpc_params = {
         "p_id_socio": target_socio_id,
         "p_id_membresia_gimnasio": id_membresia_gimnasio,
-        "p_fecha_inicio": fecha_inicio or date.today().isoformat(),
-        "p_estado": estado,
+        "p_fecha_inicio": fecha_inicio_efectiva.isoformat(),
+        "p_estado": estado_rpc,
         "p_registrar_pago": bool(registrar_pago),
         "p_metodo_pago": metodo_pago,
         "p_estado_pago": estado_pago,
@@ -357,6 +430,9 @@ async def _contratar_o_renovar_logic(
             detail="Respuesta inválida de rpc_contratar_membresia.",
         )
 
+    ms_res = resultado.get("membresia_socio")
+    ms_enriquecida = enriquecer_membresia_ciclo_vida(ms_res, hoy=hoy) if isinstance(ms_res, dict) else ms_res
+
     return {
         "mensaje": (
             "Renovación de membresía registrada exitosamente (nueva contratación histórica creada)."
@@ -364,8 +440,8 @@ async def _contratar_o_renovar_logic(
             else "Membresía contratada exitosamente."
         ),
         "socio_gimnasio": resultado.get("socio_gimnasio"),
-        "membresia": resultado.get("membresia_socio"),
-        "membresia_socio": resultado.get("membresia_socio"),
+        "membresia": ms_enriquecida,
+        "membresia_socio": ms_enriquecida,
         "pago": resultado.get("pago"),
     }
 
@@ -457,12 +533,54 @@ async def update_membresia(
     staff_ctx, _ = _verify_staff_can_manage_socios(current_user, id_gimnasio=int(memb_actual["id_gimnasio"]))
 
     staff_db: Client = staff_ctx["supabase"]
+    hoy = date.today()
+    f_ini_actual = parse_iso_date(memb_actual.get("fecha_inicio"))
+    f_venc_efectiva = parse_iso_date(req.fecha_vencimiento) or parse_iso_date(memb_actual.get("fecha_vencimiento"))
+    estado_solicitado = req.estado if req.estado is not None else calcular_estado_efectivo_membresia(memb_actual, hoy=hoy)
+
+    if f_ini_actual is not None and f_venc_efectiva is not None and f_venc_efectiva < f_ini_actual:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="La fecha de vencimiento no puede ser anterior a la fecha de inicio.",
+        )
+
+    if estado_solicitado in ESTADOS_VIGENCIA_BLOQUEANTES:
+        if f_venc_efectiva is not None and f_venc_efectiva < hoy:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="No se puede marcar como activa o programada una contratación ya vencida.",
+            )
+        if f_ini_actual is not None and f_venc_efectiva is not None:
+            contratos_asoc = _fetch_contratos_asociacion(
+                staff_db,
+                int(memb_actual["id_socio_gimnasio"]),
+                int(memb_actual["id_gimnasio"]),
+            )
+            conflicto = buscar_conflicto_superposicion(
+                contratos_asoc,
+                f_ini_actual,
+                f_venc_efectiva,
+                excluir_id_membresia=id_membresia_socio,
+                hoy=hoy,
+            )
+            if conflicto is not None:
+                raise HTTPException(
+                    status_code=status.HTTP_409_CONFLICT,
+                    detail=(
+                        f"No se puede actualizar la contratación #{id_membresia_socio} porque su período "
+                        f"({f_ini_actual.isoformat()} a {f_venc_efectiva.isoformat()}) se superpone con la contratación "
+                        f"#{conflicto.get('id_membresia_socio')} ({conflicto.get('fecha_inicio')} a {conflicto.get('fecha_vencimiento')})."
+                    ),
+                )
+
+    # Compatibilidad con el CHECK actual de BD si todavía no se aplicó la migración de 'programada'
+    estado_para_rpc = "activa" if req.estado == "programada" else req.estado
     try:
         res_rpc = staff_db.rpc(
             "rpc_actualizar_estado_membresia",
             {
                 "p_id_membresia_socio": id_membresia_socio,
-                "p_estado": req.estado,
+                "p_estado": estado_para_rpc,
                 "p_fecha_vencimiento": req.fecha_vencimiento,
             },
         ).execute()
@@ -473,10 +591,12 @@ async def update_membresia(
             detail=f"No fue posible actualizar la membresía: {exc}",
         ) from exc
 
+    updated_enr = enriquecer_membresia_ciclo_vida(updated, hoy=hoy) if isinstance(updated, dict) else updated
+
     return {
         "mensaje": "Membresía actualizada exitosamente.",
-        "membresia": updated,
-        "membresia_socio": updated,
+        "membresia": updated_enr,
+        "membresia_socio": updated_enr,
     }
 
 

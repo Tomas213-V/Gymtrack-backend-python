@@ -14,9 +14,16 @@ from app.routers.socios import (
 )
 from app.routers.membresias import (
     MEMBRESIA_SOCIO_SELECT,
+    _fetch_contratos_asociacion,
     _fetch_membresia_or_404,
     _extract_socio_id_from_membresia,
     _map_rpc_error_status,
+)
+from app.services.membresia_lifecycle import (
+    buscar_conflicto_superposicion,
+    enriquecer_membresia_ciclo_vida,
+    parse_iso_date,
+    seleccionar_membresia_vigente_y_programada,
 )
 from app.routers.planes_membresia import PLAN_COLUMNS
 
@@ -229,8 +236,8 @@ async def get_pagos_membresias(
     for sg in asociaciones:
         sg_id = int(sg.get("id_socio_gimnasio") or 0)
         socio_obj = sg.get("socio") if isinstance(sg.get("socio"), dict) else {}
-        m_list = membs_by_sg.get(sg_id, [])
-        m_activa = next((m for m in m_list if m.get("estado") == "activa"), m_list[0] if m_list else None)
+        m_list = [enriquecer_membresia_ciclo_vida(m) for m in membs_by_sg.get(sg_id, [])]
+        m_activa, m_programada = seleccionar_membresia_vigente_y_programada(m_list)
         resultado.append(
             {
                 "id_socio_gimnasio": sg_id,
@@ -239,6 +246,7 @@ async def get_pagos_membresias(
                 "socio": socio_obj,
                 "membresias": m_list,
                 "membresia_activa": m_activa,
+                "membresia_programada": m_programada,
             }
         )
     return resultado
@@ -422,6 +430,34 @@ async def registrar_pago(
             ),
         )
 
+    # Evitar que la aprobación del pago active una contratación pendiente superpuesta con otra vigente/programada
+    if (
+        req.estado == "aprobado"
+        and str(contrato.get("estado") or "").strip().lower() == "pendiente"
+        and round(total_aprobado + monto_efectivo, 2) >= precio_contrato
+    ):
+        f_ini_c = parse_iso_date(contrato.get("fecha_inicio"))
+        f_venc_c = parse_iso_date(contrato.get("fecha_vencimiento"))
+        if f_ini_c is not None and f_venc_c is not None and contrato.get("id_socio_gimnasio") is not None:
+            contratos_asoc = _fetch_contratos_asociacion(
+                staff_db, int(contrato["id_socio_gimnasio"]), contrato_gym_id
+            )
+            conflicto = buscar_conflicto_superposicion(
+                contratos_asoc,
+                f_ini_c,
+                f_venc_c,
+                excluir_id_membresia=req.id_membresia_socio,
+            )
+            if conflicto is not None:
+                raise HTTPException(
+                    status_code=status.HTTP_409_CONFLICT,
+                    detail=(
+                        f"No se puede aprobar el pago y activar la contratación #{req.id_membresia_socio} "
+                        f"porque su período ({f_ini_c.isoformat()} a {f_venc_c.isoformat()}) se superpone con la contratación "
+                        f"#{conflicto.get('id_membresia_socio')} ({conflicto.get('fecha_inicio')} a {conflicto.get('fecha_vencimiento')})."
+                    ),
+                )
+
     rpc_params = {
         "p_id_membresia_socio": req.id_membresia_socio,
         "p_monto": monto_efectivo,
@@ -503,6 +539,31 @@ async def actualizar_estado_pago(
         )
 
     staff_db: Client = staff_ctx["supabase"]
+    if nuevo_estado == "aprobado":
+        ms_pago = pago_actual.get("membresia_socio") if isinstance(pago_actual.get("membresia_socio"), dict) else None
+        if ms_pago and str(ms_pago.get("estado") or "").strip().lower() == "pendiente":
+            f_ini_c = parse_iso_date(ms_pago.get("fecha_inicio"))
+            f_venc_c = parse_iso_date(ms_pago.get("fecha_vencimiento"))
+            if f_ini_c is not None and f_venc_c is not None and ms_pago.get("id_socio_gimnasio") is not None:
+                contratos_asoc = _fetch_contratos_asociacion(
+                    staff_db, int(ms_pago["id_socio_gimnasio"]), gym_id
+                )
+                conflicto = buscar_conflicto_superposicion(
+                    contratos_asoc,
+                    f_ini_c,
+                    f_venc_c,
+                    excluir_id_membresia=int(ms_pago["id_membresia_socio"]),
+                )
+                if conflicto is not None:
+                    raise HTTPException(
+                        status_code=status.HTTP_409_CONFLICT,
+                        detail=(
+                            f"No se puede aprobar el pago #{id_pago} porque activaría la contratación "
+                            f"#{ms_pago['id_membresia_socio']} en un período superpuesto con la contratación "
+                            f"#{conflicto.get('id_membresia_socio')} ({conflicto.get('fecha_inicio')} a {conflicto.get('fecha_vencimiento')})."
+                        ),
+                    )
+
     try:
         res_rpc = staff_db.rpc(
             "rpc_actualizar_estado_pago",

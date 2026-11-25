@@ -3,7 +3,7 @@ from typing import Optional, Literal, Any
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 EstadoMembresiaInicial = Literal["pendiente", "activa"]
-EstadoMembresia = Literal["pendiente", "activa", "vencida", "cancelada"]
+EstadoMembresia = Literal["pendiente", "programada", "activa", "vencida", "cancelada"]
 EstadoPagoInicial = Literal["pendiente", "aprobado", "rechazado"]
 MetodoPagoPermitido = Literal[
     "efectivo",

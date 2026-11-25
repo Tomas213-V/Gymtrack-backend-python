@@ -469,6 +469,53 @@ async def reordenar_rutina_personal(
     return {"mensaje": "Ejercicios reordenados correctamente.", "ejercicios": reordenados}
 
 
+def _resolve_socio_active_gym_context(
+    current_user: Dict[str, Any],
+    id_gimnasio: Optional[int] = None,
+) -> tuple[Dict[str, Any], int, set[int], Optional[int]]:
+    """
+    Resuelve el perfil de socio y el gimnasio activo seleccionado en la app,
+    verificando que posea una asociación activa (`socio_gimnasio.estado = true`).
+    Rechaza con 403 cualquier intento de consultar un gimnasio donde no tenga asociación activa.
+    """
+    socio_ctx = _resolve_socio_profile_context(current_user)
+    own_socio_id = int(socio_ctx["id_socio"])
+    db: Client = socio_ctx["supabase"]
+
+    req_gym = current_user.get("requested_gym_id")
+    if id_gimnasio is not None and req_gym is not None and int(id_gimnasio) != int(req_gym):
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="No se permite cruzar gimnasios al consultar rutinas.",
+        )
+
+    asocs = _fetch_socio_gimnasios_for_socio(db, own_socio_id)
+    active_gyms = {
+        int(a["id_gimnasio"])
+        for a in asocs
+        if a.get("estado") is True and a.get("id_gimnasio") is not None
+    }
+
+    requested_gid = id_gimnasio if id_gimnasio is not None else req_gym
+    if requested_gid is not None:
+        resolved_gid = int(requested_gid)
+        if resolved_gid not in active_gyms:
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail="No posees asociación activa con el gimnasio solicitado.",
+            )
+        return socio_ctx, own_socio_id, active_gyms, resolved_gid
+
+    ctx_gid = current_user.get("id_gimnasio")
+    if ctx_gid is not None and int(ctx_gid) in active_gyms:
+        return socio_ctx, own_socio_id, active_gyms, int(ctx_gid)
+
+    if active_gyms:
+        return socio_ctx, own_socio_id, active_gyms, min(active_gyms)
+
+    return socio_ctx, own_socio_id, active_gyms, None
+
+
 # ==============================================================================
 # 2. RUTINAS ORGANIZACIONALES DEL GIMNASIO (`public.rutina_gimnasio`)
 # ==============================================================================
@@ -485,24 +532,35 @@ async def listar_rutinas_gimnasio(
     """
     Lista las plantillas de `public.rutina_gimnasio` autorizadas:
     - Para staff autorizado (dueño, admin org, admin sucursal, entrenador): catálogo completo de su gimnasio.
-    - Para socio: devuelve únicamente las rutinas de gimnasio que tiene asignadas (`rutinas_asignadas_socio_gimnasio`).
+    - Para socio: catálogo de rutinas activas (`estado = true`) del gimnasio activo donde posee
+      asociación activa (`socio_gimnasio.estado = true`), en solo lectura.
     - Rechaza a recepcionistas (`403`) en consistencia con `rutina_gimnasio_select_authorized`.
     """
     if current_user.get("rol") == "socio":
-        asig_res = await listar_asignaciones_rutinas(
-            id_gimnasio=id_gimnasio, solo_activas=solo_activas, current_user=current_user
+        socio_ctx, _own_socio_id, _active_gyms, target_gym_id = _resolve_socio_active_gym_context(
+            current_user, id_gimnasio=id_gimnasio
         )
-        rutinas_vistas: Dict[int, Dict[str, Any]] = {}
-        for a in asig_res["asignaciones"]:
-            rg = a.get("rutina_gimnasio")
-            if isinstance(rg, dict) and rg.get("id_rutina_gimnasio") is not None:
-                rutinas_vistas[int(rg["id_rutina_gimnasio"])] = _sort_rutina_items(
-                    rg, "rutina_ejercicio_gimnasio"
-                )
-        return {
-            "total": len(rutinas_vistas),
-            "rutinas": list(rutinas_vistas.values()),
-        }
+        if target_gym_id is None:
+            return {"id_gimnasio": None, "total": 0, "rutinas": []}
+
+        db: Client = socio_ctx["supabase"]
+        res = (
+            db.from_("rutina_gimnasio")
+            .select(RUTINA_GIMNASIO_SELECT)
+            .eq("id_gimnasio", target_gym_id)
+            .eq("estado", True)
+            .order("id_rutina_gimnasio", desc=True)
+            .execute()
+        )
+        rows = get_data(res) or []
+        rutinas = [
+            _sort_rutina_items(r, "rutina_ejercicio_gimnasio")
+            for r in (rows if isinstance(rows, list) else [])
+            if isinstance(r, dict)
+            and int(r.get("id_gimnasio") or 0) == target_gym_id
+            and r.get("estado") is True
+        ]
+        return {"id_gimnasio": target_gym_id, "total": len(rutinas), "rutinas": rutinas}
 
     manager_ctx, gym_id = verify_can_manage_gym_training(current_user, id_gimnasio=id_gimnasio)
     db: Client = manager_ctx["supabase"]
@@ -534,12 +592,19 @@ async def obtener_rutina_gimnasio(
     rutina = _fetch_rutina_gimnasio_or_404(db, id_rutina_gimnasio)
 
     if current_user.get("rol") == "socio":
-        asig_res = await listar_asignaciones_rutinas(current_user=current_user)
+        _socio_ctx, _own_socio_id, active_gyms, _target_gym_id = _resolve_socio_active_gym_context(current_user)
+        rutina_gym_id = int(rutina.get("id_gimnasio") or 0)
+        if rutina.get("estado") is True and rutina_gym_id in active_gyms:
+            return {"rutina": rutina}
+
+        asig_res = await listar_asignaciones_rutinas(
+            id_gimnasio=None, id_socio=None, solo_activas=False, current_user=current_user
+        )
         assigned_ids = {int(a["id_rutina_gimnasio"]) for a in asig_res["asignaciones"]}
         if id_rutina_gimnasio not in assigned_ids:
             raise HTTPException(
                 status_code=status.HTTP_403_FORBIDDEN,
-                detail="No tienes asignada esta rutina del gimnasio.",
+                detail="No tienes autorización para consultar esta rutina del gimnasio.",
             )
         return {"rutina": rutina}
 
@@ -1036,25 +1101,32 @@ async def get_rutinas_resumen(
 ):
     """
     Endpoint unificado de lectura:
-    - Socio: devuelve separadamente `rutinas_personales` (`rutina_socio`) y `rutinas_asignadas` (`rutinas_asignadas_socio_gimnasio`).
+    - Socio: devuelve separadamente `rutinas_personales` (`rutina_socio`), `rutinas_asignadas`
+      (`rutinas_asignadas_socio_gimnasio`) y `rutinas_gimnasio` (plantillas activas de su gimnasio activo).
     - Staff autorizado (dueño, admin org, admin sucursal, entrenador): devuelve `rutinas_gimnasio` y `asignaciones` del gimnasio.
     """
     if current_user.get("rol") == "socio":
+        effective_gym_id = id_gimnasio if id_gimnasio is not None else current_user.get("requested_gym_id")
         pers = await listar_rutinas_personales(solo_activas=solo_activas, current_user=current_user)
         asig = await listar_asignaciones_rutinas(
-            id_gimnasio=id_gimnasio, solo_activas=solo_activas, current_user=current_user
+            id_gimnasio=effective_gym_id, id_socio=None, solo_activas=solo_activas, current_user=current_user
+        )
+        gym_res = await listar_rutinas_gimnasio(
+            id_gimnasio=id_gimnasio, solo_activas=True, current_user=current_user
         )
         return {
             "id_socio": pers["id_socio"],
+            "id_gimnasio": gym_res.get("id_gimnasio"),
             "rutinas_personales": pers["rutinas"],
             "rutinas_asignadas": asig["asignaciones"],
+            "rutinas_gimnasio": gym_res["rutinas"],
         }
 
     gym_res = await listar_rutinas_gimnasio(
         id_gimnasio=id_gimnasio, solo_activas=solo_activas, current_user=current_user
     )
     asig_res = await listar_asignaciones_rutinas(
-        id_gimnasio=gym_res["id_gimnasio"], solo_activas=solo_activas, current_user=current_user
+        id_gimnasio=gym_res["id_gimnasio"], id_socio=None, solo_activas=solo_activas, current_user=current_user
     )
     return {
         "id_gimnasio": gym_res["id_gimnasio"],

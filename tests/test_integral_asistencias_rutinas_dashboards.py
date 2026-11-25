@@ -1289,6 +1289,75 @@ class TestIntegralAsistenciasRutinasDashboards(unittest.TestCase):
                 [token_socio73, token_dueno1, token_socio73, token_socio73, token_dueno1],
             )
 
+    def test_12_socio_ve_sus_ejercicios_y_rutinas_del_gimnasio_activo(self):
+        token_socio70 = self._make_token(self.uid_socio_70, "s70@test")
+        token_socio71 = self._make_token(self.uid_socio_71, "s71@test")
+        state = self._build_initial_state()
+        # Agregamos una rutina activa NO asignada en Gym 10, una inactiva en Gym 10 y una activa en Gym 20
+        state["rutina_gimnasio"].extend([
+            {"id_rutina_gimnasio": 4002, "id_gimnasio": 10, "nombre": "Full Body Norte Libre", "descripcion": "Abierta al gym", "nivel": "Principiante", "estado": True},
+            {"id_rutina_gimnasio": 4003, "id_gimnasio": 10, "nombre": "Rutina Pausada Norte", "descripcion": "Inactiva", "nivel": "Avanzado", "estado": False},
+            {"id_rutina_gimnasio": 4004, "id_gimnasio": 20, "nombre": "Fuerza Sur", "descripcion": "Solo Gym 20", "nivel": "Intermedio", "estado": True},
+        ])
+        state["rutina_ejercicio_gimnasio"].append(
+            {"id_rutina_ejercicio_gimnasio": 6003, "id_rutina_gimnasio": 4002, "id_gimnasio": 10, "id_ejercicio_gimnasio": 2001, "series": 3, "repeticiones": 12, "peso": 40.0, "descanso": 60, "orden": 1}
+        )
+
+        p1, p2, _, _ = self._patch_env(state)
+        with p1, p2:
+            # 1. Socio 70 ve exclusivamente sus ejercicios personales (1001, 1002; no 1003 de Socio 71)
+            r_ej = self.client.get(
+                "/api/socio/ejercicios?origen=propio",
+                headers={"Authorization": f"Bearer {token_socio70}"},
+            )
+            self.assertEqual(r_ej.status_code, 200)
+            ids_ej = [e["id_ejercicio_socio"] for e in r_ej.json()]
+            self.assertEqual(set(ids_ej), {1001, 1002})
+
+            # 2. Socio 71 (asociado a Gym 10 y Gym 20) consulta rutinas del gimnasio activo Gym 10 (vía header X-Gimnasio-Id)
+            r_g10 = self.client.get(
+                "/api/rutinas/gimnasio",
+                headers={"Authorization": f"Bearer {token_socio71}", "X-Gimnasio-Id": "10"},
+            )
+            self.assertEqual(r_g10.status_code, 200)
+            body_g10 = r_g10.json()
+            self.assertEqual(body_g10["id_gimnasio"], 10)
+            self.assertEqual({r["id_rutina_gimnasio"] for r in body_g10["rutinas"]}, {4001, 4002})
+
+            # 3. Socio 71 cambia su app a Gym 20 -> ahora solo ve rutinas activas de Gym 20
+            r_res_g20 = self.client.get(
+                "/api/rutinas",
+                headers={"Authorization": f"Bearer {token_socio71}", "X-Gimnasio-Id": "20"},
+            )
+            self.assertEqual(r_res_g20.status_code, 200)
+            res_g20 = r_res_g20.json()
+            self.assertEqual(res_g20["id_gimnasio"], 20)
+            self.assertEqual([r["id_rutina_gimnasio"] for r in res_g20["rutinas_gimnasio"]], [4004])
+
+            # 4. Socio 71 puede ver detalle de rutina activa no asignada 4002 de su gimnasio 10
+            r_det = self.client.get(
+                "/api/rutinas/gimnasio/4002",
+                headers={"Authorization": f"Bearer {token_socio71}"},
+            )
+            self.assertEqual(r_det.status_code, 200)
+            self.assertEqual(r_det.json()["rutina"]["id_rutina_gimnasio"], 4002)
+
+            # 5. Socio 70 (solo asociado a Gym 10) NO puede ver catálogo ni detalle de Gym 20 -> 403
+            self.assertEqual(
+                self.client.get(
+                    "/api/rutinas/gimnasio?id_gimnasio=20",
+                    headers={"Authorization": f"Bearer {token_socio70}"},
+                ).status_code,
+                403,
+            )
+            self.assertEqual(
+                self.client.get(
+                    "/api/rutinas/gimnasio/4004",
+                    headers={"Authorization": f"Bearer {token_socio70}"},
+                ).status_code,
+                403,
+            )
+
 
 if __name__ == "__main__":
     unittest.main()

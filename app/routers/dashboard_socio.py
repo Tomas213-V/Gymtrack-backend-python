@@ -24,7 +24,15 @@ from app.routers.socios import (
 from app.routers.planes_membresia import PLAN_COLUMNS
 from app.routers.membresias import (
     MEMBRESIA_SOCIO_SELECT,
+    _fetch_contratos_asociacion,
     _map_rpc_error_status,
+)
+from app.services.membresia_lifecycle import (
+    buscar_conflicto_superposicion,
+    calcular_inicio_encadenado,
+    enriquecer_membresia_ciclo_vida,
+    parse_iso_date,
+    seleccionar_membresia_vigente_y_programada,
 )
 from app.routers.pagos import (
     PAGO_SELECT,
@@ -165,6 +173,7 @@ async def get_dashboard_socio(
 
     # Fase 2 en paralelo (dependiente de selected_sg_id): membresía vigente y rutinas asignadas
     membresia_actual: Optional[Dict[str, Any]] = None
+    membresia_programada: Optional[Dict[str, Any]] = None
     rutinas_asignadas: List[Dict[str, Any]] = []
     if selected_sg_id is not None:
         def _q_memb(client: Client):
@@ -190,10 +199,7 @@ async def get_dashboard_socio(
             m for m in (raw_m_list if isinstance(raw_m_list, list) else [])
             if isinstance(m, dict) and int(m.get("id_socio_gimnasio") or 0) == selected_sg_id
         ]
-        membresia_actual = next(
-            (m for m in raw_m if str(m.get("estado") or "").lower() == "activa"),
-            next((m for m in raw_m if str(m.get("estado") or "").lower() == "pendiente"), None),
-        )
+        membresia_actual, membresia_programada = seleccionar_membresia_vigente_y_programada(raw_m)
         rutinas_asignadas = [
             a for a in (raw_ra_list if isinstance(raw_ra_list, list) else [])
             if isinstance(a, dict)
@@ -244,13 +250,25 @@ async def get_dashboard_socio(
             "id_membresia_gimnasio": membresia_actual.get("id_membresia_gimnasio"),
             "id_gimnasio": membresia_actual.get("id_gimnasio"),
             "plan": plan_obj.get("nombre") or "Plan Contratado",
-            "estado": membresia_actual.get("estado"),
+            "estado": metricas_membresia["estado_clave"],
+            "estado_etiqueta": metricas_membresia["estado_etiqueta"],
             "fecha_inicio": membresia_actual.get("fecha_inicio"),
             "fecha_vencimiento": membresia_actual.get("fecha_vencimiento"),
             "precio": float(membresia_actual.get("precio") or 0),
             "dias_restantes": metricas_membresia["dias_restantes"],
             "porcentaje_transcurrido": metricas_membresia["porcentaje_transcurrido"],
             "expirada": metricas_membresia["esta_vencida"],
+            "proxima_programada": (
+                {
+                    "id_membresia_socio": membresia_programada["id_membresia_socio"],
+                    "plan": (membresia_programada.get("membresia_gimnasio") or {}).get("nombre") or "Plan Programado",
+                    "fecha_inicio": membresia_programada.get("fecha_inicio"),
+                    "fecha_vencimiento": membresia_programada.get("fecha_vencimiento"),
+                    "estado": "programada",
+                }
+                if membresia_programada
+                else None
+            ),
         }
         if membresia_actual
         else {
@@ -352,10 +370,8 @@ async def get_mi_membresia(
         m for m in (get_data(res_m) or [])
         if isinstance(m, dict) and int(m.get("id_socio_gimnasio") or 0) == sg_id
     ]
-    membresia = next(
-        (m for m in raw_m if str(m.get("estado") or "").lower() == "activa"),
-        next((m for m in raw_m if str(m.get("estado") or "").lower() == "pendiente"), None),
-    )
+    membresia, membresia_programada = seleccionar_membresia_vigente_y_programada(raw_m)
+    historial_membresias = [enriquecer_membresia_ciclo_vida(m) for m in raw_m]
 
     res_pagos = db.from_("pago").select(PAGO_SELECT).order("fecha_pago", desc=True).execute()
     pagos = [
@@ -402,10 +418,35 @@ async def get_mi_membresia(
             "esta_vencida": metricas["esta_vencida"],
         }
 
+    membresia_programada_resp = None
+    if membresia_programada:
+        plan_prog_obj = (
+            membresia_programada.get("membresia_gimnasio")
+            if isinstance(membresia_programada.get("membresia_gimnasio"), dict)
+            else {}
+        )
+        met_prog = calcular_metricas_membresia(membresia_programada)
+        membresia_programada_resp = {
+            "id_membresia_socio": membresia_programada["id_membresia_socio"],
+            "id_membresia_gimnasio": membresia_programada.get("id_membresia_gimnasio"),
+            "nombre_plan": plan_prog_obj.get("nombre", "Renovación Programada"),
+            "precio": float(membresia_programada.get("precio") or 0),
+            "precio_formateado": formatear_precio_ars(membresia_programada.get("precio") or 0),
+            "fecha_inicio": membresia_programada.get("fecha_inicio"),
+            "fecha_vencimiento": membresia_programada.get("fecha_vencimiento"),
+            "fecha_inicio_formateada": met_prog["fecha_inicio_formateada"],
+            "fecha_vencimiento_formateada": met_prog["fecha_vencimiento_formateada"],
+            "estado": "programada",
+            "estado_etiqueta": "Programada",
+            "tiempo_restante_texto": met_prog["tiempo_restante_texto"],
+        }
+
     return {
         "id_socio": own_socio_id,
         "id_gimnasio": gym_id,
         "membresia": membresia_resp,
+        "membresia_programada": membresia_programada_resp,
+        "historial_membresias": historial_membresias,
         "metricas": metricas,
         "pagos": pagos,
         "planes_disponibles": planes,
@@ -435,13 +476,15 @@ async def get_planes_disponibles(
 
     res_m = (
         db.from_("membresia_socio")
-        .select("id_membresia_socio, id_membresia_gimnasio, precio, estado, fecha_vencimiento")
+        .select("id_membresia_socio, id_membresia_gimnasio, precio, estado, fecha_inicio, fecha_vencimiento")
         .eq("id_socio_gimnasio", sg_id)
         .order("fecha_vencimiento", desc=True)
         .execute()
     )
     raw_m = [m for m in (get_data(res_m) or []) if isinstance(m, dict)]
-    memb_actual = next((m for m in raw_m if str(m.get("estado") or "").lower() == "activa"), None)
+    memb_actual, _ = seleccionar_membresia_vigente_y_programada(raw_m)
+    if memb_actual and memb_actual.get("estado_efectivo") != "activa":
+        memb_actual = None
     plan_actual_id = memb_actual.get("id_membresia_gimnasio") if memb_actual else None
     precio_actual = float(memb_actual.get("precio") or 0) if memb_actual else 0.0
 
@@ -532,13 +575,35 @@ async def solicitar_contratacion_pendiente(
             detail="No posees una asociación activa en el gimnasio de este plan.",
         )
 
+    from datetime import timedelta
+
+    hoy = date.today()
+    sg_id = int(assoc["id_socio_gimnasio"])
+    duracion_plan = max(1, int(plan.get("duracion_dias") or 30))
+    contratos_previos = _fetch_contratos_asociacion(db, sg_id, plan_gym_id)
+    fecha_solicitada = parse_iso_date(req.fecha_inicio) or hoy
+    fecha_inicio_efectiva, _ = calcular_inicio_encadenado(contratos_previos, fecha_solicitada, hoy=hoy)
+    fecha_venc_efectiva = fecha_inicio_efectiva + timedelta(days=duracion_plan)
+
+    conflicto = buscar_conflicto_superposicion(
+        contratos_previos, fecha_inicio_efectiva, fecha_venc_efectiva, hoy=hoy
+    )
+    if conflicto is not None:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail=(
+                f"La solicitud ({fecha_inicio_efectiva.isoformat()} a {fecha_venc_efectiva.isoformat()}) "
+                f"se superpone con tu contratación vigente/programada #{conflicto.get('id_membresia_socio')}."
+            ),
+        )
+
     try:
         res_rpc = db.rpc(
             "rpc_contratar_membresia",
             {
                 "p_id_socio": own_socio_id,
                 "p_id_membresia_gimnasio": req.id_membresia_gimnasio,
-                "p_fecha_inicio": req.fecha_inicio or date.today().isoformat(),
+                "p_fecha_inicio": fecha_inicio_efectiva.isoformat(),
                 "p_estado": "pendiente",
                 "p_registrar_pago": False,
                 "p_metodo_pago": "efectivo",

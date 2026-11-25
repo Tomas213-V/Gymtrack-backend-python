@@ -197,38 +197,58 @@ def calcular_metricas_membresia(membresia: Optional[Dict[str, Any]]) -> Dict[str
     porcentaje_transcurrido = min(100, max(0, round((dias_usados / duracion_total_dias) * 100)))
 
     esta_vencida = dias_restantes < 0
-    if dias_restantes == 0:
-        tiempo_restante_texto = "Vence hoy"
-    elif dias_restantes < 0:
-        tiempo_restante_texto = f"Vencida hace {abs(dias_restantes)} días"
-        porcentaje_transcurrido = 100
-    else:
-        tiempo_restante_texto = f"{dias_restantes} días"
+    es_futura = f_ini > hoy
 
-    estado_clave = (membresia.get("estado") or "activa").lower()
+    est_raw = str(membresia.get("estado") or "activa").strip().lower()
+    estado_clave = est_raw
     estado_etiqueta = "Activa"
 
-    if estado_clave == "cancelada":
+    if est_raw in ("cancelada", "cancelado"):
         estado_clave = "cancelada"
         estado_etiqueta = "Cancelada"
-    elif esta_vencida or estado_clave in ("vencido", "vencida"):
+        tiempo_restante_texto = "Cancelada"
+    elif est_raw == "pendiente":
+        estado_clave = "pendiente"
+        estado_etiqueta = "Pendiente de Pago"
+        if es_futura:
+            dias_para_inicio = (f_ini - hoy).days
+            tiempo_restante_texto = f"Inicia en {dias_para_inicio} días"
+        elif dias_restantes <= 0:
+            tiempo_restante_texto = "Pendiente de acreditación"
+        else:
+            tiempo_restante_texto = f"{dias_restantes} días"
+    elif esta_vencida or est_raw in ("vencido", "vencida"):
         estado_clave = "vencida"
         estado_etiqueta = "Vencida"
-    elif estado_clave == "pendiente":
-        estado_etiqueta = "Pendiente de Pago"
-    elif estado_clave in ("activo", "activa"):
+        tiempo_restante_texto = f"Vencida hace {abs(dias_restantes)} días" if dias_restantes < 0 else "Vencida"
+        porcentaje_transcurrido = 100
+    elif es_futura or est_raw in ("programada", "programado"):
+        estado_clave = "programada"
+        estado_etiqueta = "Programada"
+        dias_para_inicio = max(1, (f_ini - hoy).days)
+        tiempo_restante_texto = (
+            "Inicia mañana" if dias_para_inicio == 1 else f"Inicia en {dias_para_inicio} días"
+        )
+        porcentaje_transcurrido = 0
+    else:
         estado_clave = "activa"
         estado_etiqueta = "Activa"
+        if dias_restantes == 0:
+            tiempo_restante_texto = "Vence hoy"
+        else:
+            tiempo_restante_texto = f"{dias_restantes} días"
 
     return {
-        "tiene_membresia": True,
+        "tiene_membresia": estado_clave in ("activa", "programada", "pendiente"),
+        "es_vigente": estado_clave == "activa",
+        "es_programada": estado_clave == "programada",
         "estado_clave": estado_clave,
         "estado_etiqueta": estado_etiqueta,
         "dias_restantes": max(0, dias_restantes),
         "dias_reales": dias_restantes,
         "tiempo_restante_texto": tiempo_restante_texto,
         "porcentaje_transcurrido": porcentaje_transcurrido,
-        "esta_vencida": esta_vencida,
+        "esta_vencida": esta_vencida or estado_clave == "vencida",
         "fecha_inicio_formateada": formatear_fecha_espanol(membresia.get("fecha_inicio")),
         "fecha_vencimiento_formateada": formatear_fecha_espanol(membresia.get("fecha_vencimiento"))
     }

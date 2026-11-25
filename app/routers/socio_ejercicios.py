@@ -117,12 +117,13 @@ async def get_ejercicios_socio(
             for a in asocs
             if a.get("estado") is True and a.get("id_gimnasio") is not None
         }
-        if id_gimnasio is not None and id_gimnasio not in active_gyms:
+        effective_gym_id = id_gimnasio if id_gimnasio is not None else current_user.get("requested_gym_id")
+        if effective_gym_id is not None and int(effective_gym_id) not in active_gyms:
             raise HTTPException(
                 status_code=status.HTTP_403_FORBIDDEN,
                 detail="No posees asociación activa con el gimnasio solicitado.",
             )
-        target_gyms = [id_gimnasio] if id_gimnasio is not None else sorted(active_gyms)
+        target_gyms = [int(effective_gym_id)] if effective_gym_id is not None else sorted(active_gyms)
         if target_gyms:
             q_g = db.from_("ejercicio_gimnasio").select(EJERCICIO_GIMNASIO_COLUMNS)
             if len(target_gyms) == 1:

@@ -13,6 +13,10 @@ from app.services.utils import get_data
 from app.routers.gimnasios import ensure_active_organizational_assignments
 from app.routers.socios import _fetch_socio_gimnasios_for_gym
 from app.routers.membresias import MEMBRESIA_SOCIO_SELECT
+from app.services.membresia_lifecycle import (
+    calcular_estado_efectivo_membresia,
+    parse_iso_date,
+)
 from app.routers.pagos import PAGO_SELECT, _extract_gym_id_from_pago
 from app.routers.asistencias import (
     ASISTENCIA_SELECT,
@@ -255,66 +259,60 @@ async def get_dashboard_admin(
         if isinstance(m, dict) and int(m.get("id_gimnasio") or 0) == gym_id
     ]
 
-    planes_conteo: Dict[str, int] = {}
-    membresias_activas = 0
+    planes_conteo: Dict[str, Set[int]] = {}
+    socios_con_plan_activo_ids: Set[int] = set()
+    socios_por_vencer_ids: Set[int] = set()
+    membresias_programadas = 0
     membresias_pendientes = 0
     total_membresias_vencidas = 0
-    total_membresias_por_vencer = 0
     proximos_vencimientos: List[Dict[str, Any]] = []
 
     for m in membresias_list:
         plan_obj = m.get("membresia_gimnasio") if isinstance(m.get("membresia_gimnasio"), dict) else {}
         plan_nombre = plan_obj.get("nombre") or "Plan sin nombre"
-        est = str(m.get("estado") or "").strip().lower()
+        est_efectivo = calcular_estado_efectivo_membresia(m, hoy=hoy_date)
+        sg_id_m = int(m["id_socio_gimnasio"]) if m.get("id_socio_gimnasio") is not None else int(m.get("id_membresia_socio") or 0)
 
-        if est != "cancelada":
-            planes_conteo[plan_nombre] = planes_conteo.get(plan_nombre, 0) + 1
-
-        if est == "cancelada":
+        if est_efectivo == "cancelada":
             continue
-        if est == "pendiente":
+        if est_efectivo == "pendiente":
             membresias_pendientes += 1
             continue
-
-        es_vencida = est == "vencida"
-        es_por_vencer = False
-        f_venc = m.get("fecha_vencimiento")
-        if f_venc:
-            try:
-                fv_date = date.fromisoformat(str(f_venc).split("T")[0])
-                dias_rest = (fv_date - hoy_date).days
-                if dias_rest < 0:
-                    es_vencida = True
-                elif est == "activa":
-                    membresias_activas += 1
-                    if dias_rest <= 7:
-                        es_por_vencer = True
-            except Exception:
-                if est == "activa":
-                    membresias_activas += 1
-        elif est == "activa":
-            membresias_activas += 1
-
-        if es_vencida:
+        if est_efectivo == "programada":
+            membresias_programadas += 1
+            continue
+        if est_efectivo == "vencida":
             total_membresias_vencidas += 1
-        elif es_por_vencer:
-            total_membresias_por_vencer += 1
-            sg = m.get("socio_gimnasio") if isinstance(m.get("socio_gimnasio"), dict) else {}
-            soc = sg.get("socio") if isinstance(sg.get("socio"), dict) else {}
-            proximos_vencimientos.append(
-                {
-                    "id_membresia_socio": m.get("id_membresia_socio"),
-                    "socio": {
-                        "id_socio": soc.get("id_socio"),
-                        "nombre": f"{soc.get('nombre') or ''} {soc.get('apellido') or ''}".strip(),
-                        "dni": soc.get("dni"),
-                    },
-                    "plan": plan_nombre,
-                    "fecha_vencimiento": f_venc,
-                }
-            )
+            continue
 
-    distribucion_planes = [{"name": nombre, "value": cnt} for nombre, cnt in planes_conteo.items()]
+        # Solo contrataciones vigentes hoy (`fecha_inicio <= hoy <= fecha_vencimiento`)
+        socios_con_plan_activo_ids.add(sg_id_m)
+        planes_conteo.setdefault(plan_nombre, set()).add(sg_id_m)
+
+        f_venc = m.get("fecha_vencimiento")
+        fv_date = parse_iso_date(f_venc)
+        if fv_date is not None:
+            dias_rest = (fv_date - hoy_date).days
+            if 0 <= dias_rest <= 7 and sg_id_m not in socios_por_vencer_ids:
+                socios_por_vencer_ids.add(sg_id_m)
+                sg = m.get("socio_gimnasio") if isinstance(m.get("socio_gimnasio"), dict) else {}
+                soc = sg.get("socio") if isinstance(sg.get("socio"), dict) else {}
+                proximos_vencimientos.append(
+                    {
+                        "id_membresia_socio": m.get("id_membresia_socio"),
+                        "socio": {
+                            "id_socio": soc.get("id_socio"),
+                            "nombre": f"{soc.get('nombre') or ''} {soc.get('apellido') or ''}".strip(),
+                            "dni": soc.get("dni"),
+                        },
+                        "plan": plan_nombre,
+                        "fecha_vencimiento": f_venc,
+                    }
+                )
+
+    membresias_activas = len(socios_con_plan_activo_ids)
+    total_membresias_por_vencer = len(socios_por_vencer_ids)
+    distribucion_planes = [{"name": nombre, "value": len(sgs)} for nombre, sgs in planes_conteo.items()]
 
     # 4. Pagos (`public.pago`) — SOLO para roles con acceso financiero (nunca entrenador)
     ingresos_kpi: Optional[Dict[str, Any]] = None
@@ -528,9 +526,12 @@ async def get_dashboard_admin(
             },
             "membresias": {
                 "activas": membresias_activas,
+                "sociosConPlanActivo": membresias_activas,
+                "programadas": membresias_programadas,
                 "pendientes": membresias_pendientes,
                 "porVencer": total_membresias_por_vencer,
                 "vencidas": total_membresias_vencidas,
+                "totales": len(membresias_list),
             },
             "rutinas": rutinas_kpi,
         },
