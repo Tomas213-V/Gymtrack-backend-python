@@ -143,9 +143,21 @@ if SUPABASE_PUBLIC_KEY_SECRET_VIOLATIONS:
         "pública (anon / sb_publishable_*) y elimine claves secretas de variables públicas o VITE_*."
     )
 
-# Clave administrativa aislada (no se utiliza en operaciones de negocio ni en registro/perfil de usuarios)
-_raw_service_key = (os.getenv("SUPABASE_SERVICE_ROLE_KEY") or "").strip()
+# Clave administrativa aislada (SOLO backend: operaciones Auth admin y tablas privadas sin permisos a anon/authenticated como `public.integracion_pago_gimnasio`)
+_raw_service_key = (
+    os.getenv("SUPABASE_SERVICE_ROLE_KEY")
+    or os.getenv("SUPABASE_SECRET_KEY")
+    or ""
+).strip()
+SUPABASE_SERVICE_ROLE_KEY_INVALID: bool = bool(_raw_service_key and not is_service_role_key(_raw_service_key))
 SUPABASE_SERVICE_ROLE_KEY: str = _raw_service_key if is_service_role_key(_raw_service_key) else ""
+
+if SUPABASE_SERVICE_ROLE_KEY_INVALID:
+    print(
+        "[ADVERTENCIA DE SEGURIDAD] SUPABASE_SERVICE_ROLE_KEY / SUPABASE_SECRET_KEY no tiene un "
+        "formato administrativo válido (service_role JWT o sb_secret_*). El cliente administrativo "
+        "no se inicializará."
+    )
 
 # Alias de compatibilidad (siempre clave pública o vacío; jamás una clave secreta)
 SUPABASE_KEY = SUPABASE_ANON_KEY
@@ -270,6 +282,7 @@ def has_service_role() -> bool:
     return supabase_admin is not None
 
 
+<<<<<<< HEAD
 def create_supabase_anon_client() -> Client:
     """
     Crea un cliente público (`anon`) aislado para una operación puntual de Supabase Auth
@@ -283,6 +296,24 @@ def create_supabase_anon_client() -> Client:
         SUPABASE_URL,
         SUPABASE_ANON_KEY,
         options=_build_common_client_options(),
+=======
+def get_supabase_admin_client() -> Client:
+    """
+    Retorna el cliente administrativo de Supabase (`service_role` / `sb_secret_*`)
+    exclusivo para operaciones privadas de servidor (p. ej. `public.integracion_pago_gimnasio`).
+    Nunca realiza fallback al cliente público ni expone valores de claves.
+    """
+    if supabase_admin is not None:
+        return supabase_admin
+    if SUPABASE_SERVICE_ROLE_KEY_INVALID:
+        raise RuntimeError(
+            "La variable SUPABASE_SERVICE_ROLE_KEY del servidor no contiene una clave "
+            "administrativa válida (service_role JWT o sb_secret_*)."
+        )
+    raise RuntimeError(
+        "Falta configurar la variable privada SUPABASE_SERVICE_ROLE_KEY en el servidor "
+        "para gestionar integraciones privadas de pago."
+>>>>>>> main
     )
 
 
@@ -325,6 +356,54 @@ MERCADOPAGO_ACCESS_TOKEN = (
     or os.getenv("Api_MER")
     or ""
 )
+# OAuth oficial de Mercado Pago (solo credenciales privadas de servidor)
+MERCADOPAGO_CLIENT_ID = (
+    os.getenv("MERCADOPAGO_CLIENT_ID")
+    or os.getenv("MP_CLIENT_ID")
+    or ""
+).strip()
+MERCADOPAGO_CLIENT_SECRET = (
+    os.getenv("MERCADOPAGO_CLIENT_SECRET")
+    or os.getenv("MP_CLIENT_SECRET")
+    or ""
+).strip()
+MERCADOPAGO_REDIRECT_URI = (
+    os.getenv("MERCADOPAGO_REDIRECT_URI")
+    or os.getenv("MP_REDIRECT_URI")
+    or ""
+).strip()
+MERCADOPAGO_OAUTH_AUTH_URL = (
+    os.getenv("MERCADOPAGO_OAUTH_AUTH_URL")
+    or "https://auth.mercadopago.com/authorization"
+).strip().rstrip("/")
+MERCADOPAGO_OAUTH_TOKEN_URL = (
+    os.getenv("MERCADOPAGO_OAUTH_TOKEN_URL")
+    or "https://api.mercadopago.com/oauth/token"
+).strip()
+MERCADOPAGO_TOKEN_ENCRYPTION_KEY = (
+    os.getenv("MERCADOPAGO_TOKEN_ENCRYPTION_KEY")
+    or os.getenv("MP_TOKEN_ENCRYPTION_KEY")
+    or ""
+).strip()
+MERCADOPAGO_STATE_SECRET = (
+    os.getenv("MERCADOPAGO_STATE_SECRET")
+    or os.getenv("MP_STATE_SECRET")
+    or ""
+).strip()
+
+# Datos no sensibles de cuenta de prueba y modo simulación para presentaciones/demos
+MP_VENDEDOR_USER_ID = (os.getenv("MP_VENDEDOR_USER_ID") or "").strip()
+MP_VENDEDOR_USUARIO = (os.getenv("MP_VENDEDOR_USUARIO") or "").strip()
+_raw_mp_demo = os.getenv("MERCADOPAGO_OAUTH_DEMO_MODE")
+if _raw_mp_demo is None:
+    # Habilitado por defecto en desarrollo/presentación cuando hay cuenta de prueba configurada y no OAuth de producción
+    MERCADOPAGO_OAUTH_DEMO_MODE = bool(
+        (MERCADOPAGO_ACCESS_TOKEN or MP_VENDEDOR_USER_ID)
+        and not (MERCADOPAGO_CLIENT_ID and MERCADOPAGO_CLIENT_SECRET)
+    )
+else:
+    MERCADOPAGO_OAUTH_DEMO_MODE = _raw_mp_demo.strip().lower() in ("1", "true", "yes", "si", "on")
+
 UALA_CLIENT_ID = os.getenv("UALA_CLIENT_ID", "")
 UALA_CLIENT_SECRET = os.getenv("UALA_CLIENT_SECRET", "")
-FRONTEND_URL = os.getenv("FRONTEND_URL", "http://localhost:5173")
+FRONTEND_URL = os.getenv("FRONTEND_URL", "http://localhost:5173").strip().rstrip("/")
