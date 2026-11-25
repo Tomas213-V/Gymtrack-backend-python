@@ -117,11 +117,13 @@ async def listar_sucursales(
     """
     ensure_active_organizational_assignments(current_user)
     user_ctx = current_user
-    if id_gimnasio is not None:
-        user_ctx = verify_can_read_gimnasio(current_user, id_gimnasio)
-        sucursales = _filter_sucursales_for_user_and_gym(user_ctx, id_gimnasio)
+    effective_gym_id = id_gimnasio if id_gimnasio is not None else current_user.get("requested_gym_id")
+    if effective_gym_id is not None:
+        gym_id_int = int(effective_gym_id)
+        user_ctx = verify_can_read_gimnasio(current_user, gym_id_int)
+        sucursales = _filter_sucursales_for_user_and_gym(user_ctx, gym_id_int)
         return {
-            "id_gimnasio": id_gimnasio,
+            "id_gimnasio": gym_id_int,
             "total": len(sucursales),
             "sucursales": sucursales,
         }
