@@ -1,4 +1,4 @@
-from datetime import date, timedelta
+from datetime import date, datetime, timedelta, timezone
 from typing import Dict, Any, Optional, List
 from fastapi import APIRouter, HTTPException, status, Depends, Query, Path
 from supabase import Client
@@ -98,6 +98,128 @@ def _extract_socio_id_from_membresia(memb: Dict[str, Any]) -> Optional[int]:
     if isinstance(sg, dict) and sg.get("id_socio") is not None:
         return int(sg["id_socio"])
     return None
+
+
+def _cancelar_membresias_activas_previas(
+    db: Client,
+    gym_id: int,
+    id_socio_gimnasio: int,
+    excluir_id_membresia: Optional[int] = None,
+) -> List[int]:
+    """
+    Cancela lógicamente (`estado = 'cancelada'`) cualquier membresía activa previa del mismo
+    `id_socio_gimnasio` en el gimnasio, conservando su historial intacto.
+    """
+    try:
+        res = (
+            db.from_("membresia_socio")
+            .select("id_membresia_socio, estado")
+            .eq("id_gimnasio", gym_id)
+            .eq("id_socio_gimnasio", id_socio_gimnasio)
+            .eq("estado", "activa")
+            .execute()
+        )
+        rows = get_data(res) or []
+    except Exception:
+        return []
+
+    canceladas: List[int] = []
+    for row in (rows if isinstance(rows, list) else []):
+        if not isinstance(row, dict):
+            continue
+        mid = row.get("id_membresia_socio")
+        if mid is None:
+            continue
+        mid_int = int(mid)
+        if excluir_id_membresia is not None and mid_int == int(excluir_id_membresia):
+            continue
+        if str(row.get("estado") or "").strip().lower() != "activa":
+            continue
+        db.rpc(
+            "rpc_actualizar_estado_membresia",
+            {
+                "p_id_membresia_socio": mid_int,
+                "p_estado": "cancelada",
+                "p_fecha_vencimiento": None,
+            },
+        ).execute()
+        canceladas.append(mid_int)
+    return canceladas
+
+
+def _aprobar_o_registrar_pago_para_activar(
+    db: Client,
+    memb_actual: Dict[str, Any],
+    metodo_pago: str = "efectivo",
+    comprobante: Optional[str] = None,
+) -> Optional[Dict[str, Any]]:
+    """
+    Asegura que existan pagos aprobados que cubran el importe acordado de la membresía antes de
+    activarla, evitando el rechazo del trigger/RPC de Supabase cuando una membresía pendiente
+    se pasa a 'activa' desde el panel administrativo.
+    """
+    memb_id = int(memb_actual["id_membresia_socio"])
+    precio_contrato = round(float(memb_actual.get("precio") or 0), 2)
+    if precio_contrato <= 0:
+        return None
+
+    res_pagos = (
+        db.from_("pago")
+        .select("id_pago, monto, estado")
+        .eq("id_membresia_socio", memb_id)
+        .execute()
+    )
+    pagos_list = get_data(res_pagos) or []
+    if not isinstance(pagos_list, list):
+        pagos_list = []
+
+    total_aprobado = round(
+        sum(
+            float(p.get("monto") or 0)
+            for p in pagos_list
+            if isinstance(p, dict) and str(p.get("estado") or "").strip().lower() == "aprobado"
+        ),
+        2,
+    )
+    if total_aprobado >= precio_contrato:
+        return None
+
+    ultimo_pago = None
+    # 1. Aprobar primero pagos pendientes existentes que cubran parte o la totalidad del saldo
+    for p in pagos_list:
+        if not isinstance(p, dict) or str(p.get("estado") or "").strip().lower() != "pendiente":
+            continue
+        monto_p = round(float(p.get("monto") or 0), 2)
+        if monto_p > 0 and round(total_aprobado + monto_p, 2) <= precio_contrato:
+            res_upd_p = db.rpc(
+                "rpc_actualizar_estado_pago",
+                {
+                    "p_id_pago": int(p["id_pago"]),
+                    "p_estado": "aprobado",
+                },
+            ).execute()
+            ultimo_pago = get_data(res_upd_p)
+            total_aprobado = round(total_aprobado + monto_p, 2)
+            if total_aprobado >= precio_contrato:
+                return ultimo_pago
+
+    # 2. Si aún queda saldo pendiente, registrar un pago aprobado por la diferencia
+    faltante = round(max(0.0, precio_contrato - total_aprobado), 2)
+    if faltante > 0:
+        res_reg = db.rpc(
+            "rpc_registrar_pago",
+            {
+                "p_id_membresia_socio": memb_id,
+                "p_monto": faltante,
+                "p_metodo_pago": metodo_pago or "efectivo",
+                "p_estado": "aprobado",
+                "p_comprobante": comprobante.strip() if comprobante and comprobante.strip() else None,
+                "p_fecha_pago": datetime.now(timezone.utc).isoformat(),
+            },
+        ).execute()
+        ultimo_pago = get_data(res_reg)
+
+    return ultimo_pago
 
 
 @router.get("/mis-membresias", status_code=status.HTTP_200_OK)
@@ -274,6 +396,7 @@ async def _contratar_o_renovar_logic(
     fecha_vencimiento_tamper: Any = None,
     current_user: Dict[str, Any],
     es_renovacion: bool = False,
+    cancelar_activas_previas: bool = False,
 ) -> Dict[str, Any]:
     """
     Orquesta contrataciones y renovaciones en `public.membresia_socio` delegando la operación
@@ -379,6 +502,17 @@ async def _contratar_o_renovar_logic(
     hoy = date.today()
     sg_id = int(assoc["id_socio_gimnasio"])
     duracion_plan = max(1, int(plan.get("duracion_dias") or 30))
+
+    # Si se solicita activar un nuevo plan reemplazando membresías activas previas, cancelarlas primero
+    if cancelar_activas_previas and rol != "socio" and estado_rpc == "activa":
+        try:
+            _cancelar_membresias_activas_previas(actor_db, plan_gym_id, sg_id)
+        except Exception as exc:
+            raise HTTPException(
+                status_code=_map_rpc_error_status(exc),
+                detail=f"No fue posible cancelar la membresía activa previa del socio: {exc}",
+            ) from exc
+
     contratos_previos = _fetch_contratos_asociacion(actor_db, sg_id, plan_gym_id)
 
     fecha_solicitada = parse_iso_date(fecha_inicio) or hoy
@@ -470,6 +604,7 @@ async def create_membresia(
         fecha_vencimiento_tamper=req.fecha_vencimiento,
         current_user=current_user,
         es_renovacion=False,
+        cancelar_activas_previas=req.cancelar_activas_previas,
     )
 
 
@@ -496,6 +631,7 @@ async def renovar_membresia(
         monto_override_tamper=req.monto_override,
         current_user=current_user,
         es_renovacion=True,
+        cancelar_activas_previas=req.cancelar_activas_previas,
     )
 
 
@@ -544,12 +680,29 @@ async def update_membresia(
             detail="La fecha de vencimiento no puede ser anterior a la fecha de inicio.",
         )
 
+    membresias_previas_canceladas: List[int] = []
+    pago_generado: Optional[Dict[str, Any]] = None
+
     if estado_solicitado in ESTADOS_VIGENCIA_BLOQUEANTES:
         if f_venc_efectiva is not None and f_venc_efectiva < hoy:
             raise HTTPException(
                 status_code=status.HTTP_400_BAD_REQUEST,
                 detail="No se puede marcar como activa o programada una contratación ya vencida.",
             )
+        if req.cancelar_activas_previas and memb_actual.get("id_socio_gimnasio") is not None:
+            try:
+                membresias_previas_canceladas = _cancelar_membresias_activas_previas(
+                    staff_db,
+                    int(memb_actual["id_gimnasio"]),
+                    int(memb_actual["id_socio_gimnasio"]),
+                    excluir_id_membresia=id_membresia_socio,
+                )
+            except Exception as exc:
+                raise HTTPException(
+                    status_code=_map_rpc_error_status(exc),
+                    detail=f"No fue posible cancelar membresías activas previas del socio: {exc}",
+                ) from exc
+
         if f_ini_actual is not None and f_venc_efectiva is not None:
             contratos_asoc = _fetch_contratos_asociacion(
                 staff_db,
@@ -576,6 +729,19 @@ async def update_membresia(
     # Compatibilidad con el CHECK actual de BD si todavía no se aplicó la migración de 'programada'
     estado_para_rpc = "activa" if req.estado == "programada" else req.estado
     try:
+        # Si pasa de pendiente a activa con sincronización de pago, aprobar/registrar el pago antes de activar
+        if (
+            estado_para_rpc == "activa"
+            and req.registrar_pago_si_falta
+            and str(memb_actual.get("estado") or "").strip().lower() == "pendiente"
+        ):
+            pago_generado = _aprobar_o_registrar_pago_para_activar(
+                staff_db,
+                memb_actual,
+                metodo_pago=req.metodo_pago,
+                comprobante=req.comprobante,
+            )
+
         res_rpc = staff_db.rpc(
             "rpc_actualizar_estado_membresia",
             {
@@ -597,6 +763,8 @@ async def update_membresia(
         "mensaje": "Membresía actualizada exitosamente.",
         "membresia": updated_enr,
         "membresia_socio": updated_enr,
+        "pago": pago_generado,
+        "membresias_previas_canceladas": membresias_previas_canceladas,
     }
 
 

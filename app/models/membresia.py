@@ -46,6 +46,7 @@ class MembresiaCreate(BaseModel):
     metodo_pago: MetodoPagoPermitido = "efectivo"
     estado_pago: EstadoPagoInicial = "aprobado"
     comprobante: Optional[str] = Field(default=None, max_length=180)
+    cancelar_activas_previas: bool = False
     # Campos protegidos capturados explícitamente para bloqueo controlado 403/400
     precio: Optional[Any] = None
     monto_override: Optional[Any] = None
@@ -76,6 +77,7 @@ class MembresiaRenovarRequest(BaseModel):
     metodo_pago: MetodoPagoPermitido = "efectivo"
     estado_pago: EstadoPagoInicial = "aprobado"
     comprobante: Optional[str] = Field(default=None, max_length=180)
+    cancelar_activas_previas: bool = False
     precio: Optional[Any] = None
     monto_override: Optional[Any] = None
 
@@ -96,6 +98,10 @@ class MembresiaUpdate(BaseModel):
 
     estado: Optional[EstadoMembresia] = None
     fecha_vencimiento: Optional[str] = None
+    registrar_pago_si_falta: bool = False
+    cancelar_activas_previas: bool = False
+    metodo_pago: MetodoPagoPermitido = "efectivo"
+    comprobante: Optional[str] = Field(default=None, max_length=180)
     # Campos inmutables capturados para rechazo explícito 403
     id_membresia_gimnasio: Optional[Any] = None
     id_socio_gimnasio: Optional[Any] = None
