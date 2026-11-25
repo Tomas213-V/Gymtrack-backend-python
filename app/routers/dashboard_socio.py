@@ -11,10 +11,7 @@ from app.services.utils import (
     get_data,
     sugerir_beneficios,
 )
-from app.services.payment_service import (
-    crear_preferencia_mercadopago,
-    crear_orden_uala,
-)
+from app.services.payment_service import crear_preferencia_mercadopago
 from app.models.dashboard_socio import (
     CheckinSocioRequest,
     SolicitarMembresiaSocio,
@@ -568,7 +565,7 @@ async def iniciar_pago(
     req: IniciarPagoSocio,
     current_user: Dict[str, Any] = Depends(get_current_user),
 ):
-    """Prepara una sesión de pago digital (Mercado Pago / Ualá) usando exclusivamente el precio real del plan."""
+    """Prepara una sesión de pago digital (Mercado Pago) usando exclusivamente el precio real del plan."""
     socio_ctx = _resolve_socio_profile_context(current_user)
     own_socio_id = int(socio_ctx["id_socio"])
     db: Client = socio_ctx["supabase"]
@@ -614,22 +611,13 @@ async def iniciar_pago(
     monto_real = round(float(plan.get("precio") or 0), 2)
     external_ref = f"GYM-{plan_gym_id}-SOC-{own_socio_id}-PL-{req.id_membresia_gimnasio}-{int(time.time())}"
 
-    if req.proveedor == "uala":
-        orden = await crear_orden_uala(
-            titulo=plan.get("nombre", "Plan GymTrack"),
-            monto=monto_real,
-            external_reference=external_ref,
-            socio=socio,
-            gimnasio=gym,
-        )
-    else:
-        orden = await crear_preferencia_mercadopago(
-            titulo=plan.get("nombre", "Plan GymTrack"),
-            monto=monto_real,
-            external_reference=external_ref,
-            socio=socio,
-            gimnasio=gym,
-        )
+    orden = await crear_preferencia_mercadopago(
+        titulo=plan.get("nombre", "Plan GymTrack"),
+        monto=monto_real,
+        external_reference=external_ref,
+        socio=socio,
+        gimnasio=gym,
+    )
 
     return {
         "orden": orden,

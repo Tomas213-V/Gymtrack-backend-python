@@ -25,9 +25,9 @@ class SolicitarMembresiaSocio(BaseModel):
 
 class IniciarPagoSocio(BaseModel):
     """
-    Prepara un checkout externo (Mercado Pago / Ualá) tomando el precio real desde `public.membresia_gimnasio`.
+    Prepara un checkout externo (Mercado Pago) tomando el precio real desde `public.membresia_gimnasio`.
     """
     model_config = ConfigDict(extra="forbid")
 
     id_membresia_gimnasio: int = Field(..., gt=0)
-    proveedor: Literal["mercadopago", "uala"] = "mercadopago"
+    proveedor: Literal["mercadopago"] = "mercadopago"

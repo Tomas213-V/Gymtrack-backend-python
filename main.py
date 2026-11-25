@@ -31,6 +31,7 @@ from app.routers import (
     dashboard_socio,
     dashboard_admin,
     socio_ejercicios,
+    integraciones_pago,
 )
 
 
@@ -161,6 +162,7 @@ app.include_router(asistencias.router)
 app.include_router(dashboard_socio.router)
 app.include_router(dashboard_admin.router)
 app.include_router(socio_ejercicios.router)
+app.include_router(integraciones_pago.router)
 
 
 # 5. PUESTA EN MARCHA DEL SERVIDOR
