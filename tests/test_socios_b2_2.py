@@ -169,6 +169,8 @@ class FakeSociosRpcBuilder:
             return FakeSupabaseResponse(self.client._rpc_asociar_socio_gimnasio(self.params))
         if self.fn_name == "rpc_cambiar_estado_socio_gimnasio":
             return FakeSupabaseResponse(self.client._rpc_cambiar_estado_socio_gimnasio(self.params))
+        if self.fn_name == "rpc_actualizar_estado_membresia":
+            return FakeSupabaseResponse(self.client._rpc_actualizar_estado_membresia(self.params))
         raise RuntimeError(f"RPC no soportada en mock: {self.fn_name}")
 
 
@@ -274,6 +276,21 @@ class FakeSociosSupabaseClient:
         if not row:
             raise ValueError(f"La asociación socio_gimnasio #{sg_id} no existe.")
         row["estado"] = nuevo_estado
+        return copy.deepcopy(row)
+
+    def _rpc_actualizar_estado_membresia(self, params: Dict[str, Any]) -> Dict[str, Any]:
+        mid = int(params["p_id_membresia_socio"])
+        nuevo_estado = params.get("p_estado")
+        nueva_fecha_venc = params.get("p_fecha_vencimiento")
+
+        membs = self.state.get("membresia_socio", [])
+        row = next((m for m in membs if int(m["id_membresia_socio"]) == mid), None)
+        if not row:
+            raise ValueError(f"La contratación #{mid} no existe.")
+        if nuevo_estado is not None:
+            row["estado"] = str(nuevo_estado).strip().lower()
+        if nueva_fecha_venc is not None:
+            row["fecha_vencimiento"] = nueva_fecha_venc
         return copy.deepcopy(row)
 
 
@@ -891,6 +908,110 @@ class TestSociosB22(unittest.TestCase):
                 ).status_code,
                 403,
             )
+
+    # 15. Baja de socio desactiva su estado en el gimnasio y cancela su membresía activa sin afectar otros gimnasios
+    def test_15_baja_socio_desactiva_estado_y_membresia_activa(self):
+        token_dueno_1 = self._make_token(self.uid_dueno_1, "dueno1@gymtrack.test")
+        state = self._build_initial_state()
+        state["membresia_socio"] = [
+            # Membresía activa de Socio 71 en Gym 10 (sg 702) -> debe cancelarse
+            {
+                "id_membresia_socio": 901,
+                "id_socio_gimnasio": 702,
+                "id_membresia_gimnasio": 501,
+                "id_gimnasio": 10,
+                "precio": 25000.0,
+                "duracion_dias_contratados": 30,
+                "limite_asistencias_semanales": None,
+                "limite_asistencias_totales": None,
+                "fecha_inicio": "2026-11-01",
+                "fecha_vencimiento": "2026-12-01",
+                "estado": "activa",
+                "creado_en": "2026-11-01T10:00:00Z",
+            },
+            # Membresía activa del mismo Socio 71 en Gym 20 (sg 703) -> debe mantenerse activa
+            {
+                "id_membresia_socio": 902,
+                "id_socio_gimnasio": 703,
+                "id_membresia_gimnasio": 502,
+                "id_gimnasio": 20,
+                "precio": 30000.0,
+                "duracion_dias_contratados": 30,
+                "limite_asistencias_semanales": None,
+                "limite_asistencias_totales": None,
+                "fecha_inicio": "2026-11-01",
+                "fecha_vencimiento": "2026-12-01",
+                "estado": "activa",
+                "creado_en": "2026-11-01T10:00:00Z",
+            },
+            # Membresía activa de Socio 70 en Gym 10 (sg 701) -> debe cancelarse vía PATCH /estado
+            {
+                "id_membresia_socio": 903,
+                "id_socio_gimnasio": 701,
+                "id_membresia_gimnasio": 501,
+                "id_gimnasio": 10,
+                "precio": 25000.0,
+                "duracion_dias_contratados": 30,
+                "limite_asistencias_semanales": None,
+                "limite_asistencias_totales": None,
+                "fecha_inicio": "2026-11-10",
+                "fecha_vencimiento": "2026-12-10",
+                "estado": "activa",
+                "creado_en": "2026-11-10T10:00:00Z",
+            },
+        ]
+
+        p1, p2, fake_db = self._patch_env(state=state)
+        with p1, p2:
+            # 1) Baja vía DELETE /api/socios/71
+            res_baja = self.client.delete(
+                "/api/socios/71?id_gimnasio=10",
+                headers={"Authorization": f"Bearer {token_dueno_1}", "X-Gimnasio-Id": "10"},
+            )
+            self.assertEqual(res_baja.status_code, 200, res_baja.text)
+            body_baja = res_baja.json()
+            self.assertFalse(body_baja["socio_gimnasio"]["estado"])
+            self.assertEqual(body_baja["membresias_desactivadas"], [901])
+
+            m901 = next(m for m in fake_db.state["membresia_socio"] if m["id_membresia_socio"] == 901)
+            m902 = next(m for m in fake_db.state["membresia_socio"] if m["id_membresia_socio"] == 902)
+            self.assertEqual(m901["estado"], "cancelada")
+            self.assertEqual(m902["estado"], "activa")
+
+            # 2) El listado y detalle del gimnasio ahora muestran estado=False y membresía cancelada
+            res_list = self.client.get(
+                "/api/socios?estado=inactivo&id_gimnasio=10",
+                headers={"Authorization": f"Bearer {token_dueno_1}", "X-Gimnasio-Id": "10"},
+            )
+            self.assertEqual(res_list.status_code, 200, res_list.text)
+            socio_71_list = next(s for s in res_list.json()["socios"] if s["id_socio"] == 71)
+            self.assertIs(socio_71_list["estado"], False)
+            self.assertIs(socio_71_list["estado_asociacion"], False)
+            self.assertIs(socio_71_list["estado_global"], True)
+            self.assertIs(socio_71_list["tiene_contrasena"], True)
+            self.assertEqual(socio_71_list["membresia_actual"]["estado"], "cancelada")
+
+            res_det = self.client.get(
+                "/api/socios/71?id_gimnasio=10",
+                headers={"Authorization": f"Bearer {token_dueno_1}", "X-Gimnasio-Id": "10"},
+            )
+            self.assertEqual(res_det.status_code, 200, res_det.text)
+            self.assertIs(res_det.json()["socio"]["estado"], False)
+            self.assertIs(res_det.json()["socio"]["estado_asociacion"], False)
+            self.assertIs(res_det.json()["socio"]["tiene_contrasena"], True)
+            self.assertEqual(res_det.json()["membresia_actual"]["estado"], "cancelada")
+
+            # 3) Desactivar vía PATCH /api/socios/70/estado también cancela la membresía activa 903
+            res_patch = self.client.patch(
+                "/api/socios/70/estado",
+                json={"estado": False, "id_gimnasio": 10},
+                headers={"Authorization": f"Bearer {token_dueno_1}", "X-Gimnasio-Id": "10"},
+            )
+            self.assertEqual(res_patch.status_code, 200, res_patch.text)
+            self.assertFalse(res_patch.json()["socio_gimnasio"]["estado"])
+            self.assertEqual(res_patch.json()["membresias_desactivadas"], [903])
+            m903 = next(m for m in fake_db.state["membresia_socio"] if m["id_membresia_socio"] == 903)
+            self.assertEqual(m903["estado"], "cancelada")
 
 
 if __name__ == "__main__":

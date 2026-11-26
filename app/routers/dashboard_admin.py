@@ -9,6 +9,7 @@ from app.core.dependencies import (
     _switch_profile_context_if_available,
     run_db_parallel,
 )
+from app.services.demo_payment_store import merge_demo_membresias, merge_demo_pagos
 from app.services.utils import get_data
 from app.routers.gimnasios import ensure_active_organizational_assignments
 from app.routers.socios import _fetch_socio_gimnasios_for_gym
@@ -254,8 +255,12 @@ async def get_dashboard_admin(
     )
 
     # 3. Contrataciones de membresías (`public.membresia_socio`)
+    membresias_merged = merge_demo_membresias(
+        membresias_raw if isinstance(membresias_raw, list) else [],
+        gym_id=gym_id,
+    )
     membresias_list = [
-        m for m in (membresias_raw if isinstance(membresias_raw, list) else [])
+        m for m in membresias_merged
         if isinstance(m, dict) and int(m.get("id_gimnasio") or 0) == gym_id
     ]
 
@@ -320,8 +325,12 @@ async def get_dashboard_admin(
     ultimos_pagos: List[Dict[str, Any]] = []
 
     if can_view_financials:
+        pagos_merged = merge_demo_pagos(
+            pagos_raw if isinstance(pagos_raw, list) else [],
+            gym_id=gym_id,
+        )
         pagos_list = [
-            p for p in (pagos_raw if isinstance(pagos_raw, list) else [])
+            p for p in pagos_merged
             if isinstance(p, dict) and _extract_gym_id_from_pago(p) == gym_id
         ]
 

@@ -31,3 +31,13 @@ class IniciarPagoSocio(BaseModel):
 
     id_membresia_gimnasio: int = Field(..., gt=0)
     proveedor: Literal["mercadopago"] = "mercadopago"
+
+
+class SimularPagoMercadoPagoSocio(BaseModel):
+    """
+    Simula la acreditación de un pago con Mercado Pago para un plan del gimnasio activo del socio.
+    """
+    model_config = ConfigDict(extra="forbid")
+
+    id_membresia_gimnasio: int = Field(..., gt=0)
+    fecha_inicio: Optional[str] = None

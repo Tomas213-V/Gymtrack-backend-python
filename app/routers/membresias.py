@@ -4,6 +4,11 @@ from fastapi import APIRouter, HTTPException, status, Depends, Query, Path
 from supabase import Client
 
 from app.core.dependencies import get_current_user, run_db_parallel
+from app.services.demo_payment_store import (
+    get_demo_membresia_by_id,
+    merge_demo_membresias,
+    update_demo_membresia,
+)
 from app.services.utils import get_data
 from app.services.membresia_lifecycle import (
     ESTADOS_DB_ACTIVOS,
@@ -86,6 +91,8 @@ def _fetch_membresia_or_404(db: Client, id_membresia_socio: int) -> Dict[str, An
         .execute()
     )
     memb = get_data(res)
+    if not isinstance(memb, dict):
+        memb = get_demo_membresia_by_id(id_membresia_socio)
     if not isinstance(memb, dict):
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
@@ -352,9 +359,10 @@ async def get_membresias(
         ],
     )
     hoy = date.today()
+    rows = merge_demo_membresias(rows if isinstance(rows, list) else [], gym_id=gym_id)
     membresias: List[Dict[str, Any]] = []
     socios_activos_set = set()
-    for m in (rows if isinstance(rows, list) else []):
+    for m in rows:
         if not isinstance(m, dict) or int(m.get("id_gimnasio") or 0) != gym_id:
             continue
         if id_socio is not None and _extract_socio_id_from_membresia(m) != id_socio:
@@ -815,6 +823,16 @@ async def cancelar_membresia(
     staff_ctx, _ = _verify_staff_can_manage_socios(current_user, id_gimnasio=int(memb_actual["id_gimnasio"]))
 
     staff_db: Client = staff_ctx["supabase"]
+    demo_memb = get_demo_membresia_by_id(id_membresia_socio)
+    if demo_memb is not None:
+        updated = update_demo_membresia(id_membresia_socio, estado="cancelada")
+        return {
+            "mensaje": "Membresía cancelada exitosamente conservando el historial contable.",
+            "cancelada": True,
+            "membresia": updated,
+            "membresia_socio": updated,
+        }
+
     try:
         res_rpc = staff_db.rpc(
             "rpc_actualizar_estado_membresia",

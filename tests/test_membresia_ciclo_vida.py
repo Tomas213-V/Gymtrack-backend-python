@@ -1,7 +1,9 @@
 import copy
 import unittest
 from datetime import date, timedelta
+from unittest.mock import patch
 
+from app.routers import dashboard_socio as dashboard_socio_router
 from tests import test_planes_membresias_pagos_b2_3 as b23
 
 
@@ -231,6 +233,143 @@ class TestCicloVidaMembresias(unittest.TestCase):
             sm_body = r_sm.json()
             self.assertEqual(sm_body["membresia"]["estado"], "activa")
             self.assertIsNone(sm_body["membresia_programada"])
+
+    def test_05_simular_pago_mercadopago_socio_con_y_sin_service_role(self):
+        token_socio70 = self._make_token(self.uid_socio_70, "socio70@gymtrack.test")
+        dashboard_socio_router.reset_demo_simulated_payments_store()
+
+        # Caso A: con service_role habilitado en servidor -> persiste en BD via RPCs oficiales
+        p1, p2, fake_db, _ = self._patch_env()
+        with p1, p2, (
+            patch("app.config.has_service_role", return_value=True)
+        ), (
+            patch("app.config.get_supabase_admin_client", return_value=fake_db)
+        ):
+            hoy = date.today()
+            contrato_801 = next(m for m in fake_db.state["membresia_socio"] if m["id_membresia_socio"] == 801)
+            contrato_801["fecha_inicio"] = (hoy - timedelta(days=25)).isoformat()
+            contrato_801["fecha_vencimiento"] = (hoy + timedelta(days=5)).isoformat()
+            contrato_801["estado"] = "activa"
+
+            res_sim_bd = self.client.post(
+                "/api/socio/pagos/simular-mercadopago",
+                json={"id_membresia_gimnasio": 501},
+                headers={"Authorization": f"Bearer {token_socio70}"},
+            )
+            self.assertEqual(res_sim_bd.status_code, 201, res_sim_bd.text)
+            body_bd = res_sim_bd.json()
+            self.assertTrue(body_bd["persistido_en_bd"])
+            self.assertEqual(body_bd["modo"], "mercadopago_simulado_bd")
+            self.assertEqual(body_bd["dias_transferidos"], 5)
+            self.assertEqual(body_bd["membresias_previas_canceladas"], [801])
+            self.assertEqual(body_bd["membresia_socio"]["estado"], "activa")
+            self.assertEqual(body_bd["membresia_socio"]["fecha_vencimiento"], (hoy + timedelta(days=35)).isoformat())
+            self.assertEqual(body_bd["pago"]["metodo_pago"], "mercadopago")
+            self.assertEqual(body_bd["pago"]["estado"], "aprobado")
+
+        # Caso B: sin service_role local (modo presentacion) -> refleja membresia activa y pago MP en panel socio Y paneles del dueno
+        token_dueno1 = self._make_token(self.uid_dueno_1, "dueno1@gymtrack.test")
+        p1b, p2b, fake_db_b, _ = self._patch_env()
+        with p1b, p2b, patch("app.config.has_service_role", return_value=False):
+            hoy = date.today()
+            contrato_801_b = next(m for m in fake_db_b.state["membresia_socio"] if m["id_membresia_socio"] == 801)
+            contrato_801_b["fecha_inicio"] = (hoy - timedelta(days=28)).isoformat()
+            contrato_801_b["fecha_vencimiento"] = (hoy + timedelta(days=2)).isoformat()
+            contrato_801_b["estado"] = "activa"
+            fake_db_b.state.setdefault("asistencia_socio", [])
+            fake_db_b.state.setdefault("rutina_socio", [])
+            fake_db_b.state.setdefault("rutinas_asignadas_socio_gimnasio", [])
+
+            res_sim_demo = self.client.post(
+                "/api/socio/pagos/simular-mercadopago",
+                json={"id_membresia_gimnasio": 501},
+                headers={"Authorization": f"Bearer {token_socio70}"},
+            )
+            self.assertEqual(res_sim_demo.status_code, 201, res_sim_demo.text)
+            body_demo = res_sim_demo.json()
+            self.assertFalse(body_demo["persistido_en_bd"])
+            self.assertEqual(body_demo["modo"], "mercadopago_simulado_presentacion")
+            self.assertEqual(body_demo["dias_transferidos"], 2)
+            self.assertEqual(body_demo["membresia_socio"]["fecha_vencimiento"], (hoy + timedelta(days=32)).isoformat())
+            self.assertEqual(body_demo["pago"]["metodo_pago"], "mercadopago")
+            self.assertEqual(body_demo["pago"]["estado"], "aprobado")
+
+            r_sm = self.client.get(
+                "/api/socio/membresia",
+                headers={"Authorization": f"Bearer {token_socio70}"},
+            )
+            self.assertEqual(r_sm.status_code, 200)
+            sm_json = r_sm.json()
+            self.assertEqual(sm_json["membresia"]["estado"], "activa")
+            self.assertEqual(sm_json["membresia"]["fecha_vencimiento"], (hoy + timedelta(days=32)).isoformat())
+            self.assertEqual(sm_json["pagos"][0]["metodo_pago"], "mercadopago")
+            self.assertEqual(sm_json["pagos"][0]["estado"], "aprobado")
+
+            r_dash = self.client.get(
+                "/api/socio/dashboard",
+                headers={"Authorization": f"Bearer {token_socio70}"},
+            )
+            self.assertEqual(r_dash.status_code, 200)
+            self.assertEqual(r_dash.json()["membresia"]["estado"], "activa")
+            self.assertEqual(r_dash.json()["ultimo_pago"]["metodo_pago"], "mercadopago")
+
+            # Verificar visibilidad en los paneles del dueno: /api/membresias, /api/pagos, /api/pagos/resumen, /api/dashboard/admin y /api/socios
+            r_membs_dueno = self.client.get(
+                "/api/membresias",
+                headers={"Authorization": f"Bearer {token_dueno1}"},
+            )
+            self.assertEqual(r_membs_dueno.status_code, 200, r_membs_dueno.text)
+            sim_ms_id = body_demo["membresia_socio"]["id_membresia_socio"]
+            m_dueno = next(
+                (m for m in r_membs_dueno.json()["membresias"] if m["id_membresia_socio"] == sim_ms_id),
+                None,
+            )
+            self.assertIsNotNone(m_dueno)
+            self.assertEqual(m_dueno["estado_efectivo"], "activa")
+
+            r_pagos_dueno = self.client.get(
+                "/api/pagos",
+                headers={"Authorization": f"Bearer {token_dueno1}"},
+            )
+            self.assertEqual(r_pagos_dueno.status_code, 200, r_pagos_dueno.text)
+            sim_pago_id = body_demo["pago"]["id_pago"]
+            p_dueno = next(
+                (p for p in r_pagos_dueno.json()["datos"] if p["id_pago"] == sim_pago_id),
+                None,
+            )
+            self.assertIsNotNone(p_dueno)
+            self.assertEqual(p_dueno["metodo_pago"], "mercadopago")
+            self.assertEqual(p_dueno["estado"], "aprobado")
+
+            r_res_pagos = self.client.get(
+                "/api/pagos/resumen",
+                headers={"Authorization": f"Bearer {token_dueno1}"},
+            )
+            self.assertEqual(r_res_pagos.status_code, 200)
+            self.assertGreaterEqual(r_res_pagos.json()["pagos_aprobados"], 1)
+
+            r_dash_dueno = self.client.get(
+                "/api/dashboard/admin",
+                headers={"Authorization": f"Bearer {token_dueno1}"},
+            )
+            self.assertEqual(r_dash_dueno.status_code, 200)
+            self.assertTrue(
+                any(
+                    p["id_pago"] == sim_pago_id
+                    for p in r_dash_dueno.json()["actividadReciente"]["pagos"]
+                )
+            )
+            self.assertGreaterEqual(r_dash_dueno.json()["kpis"]["ingresos"]["pagosAprobados"], 2)
+
+            r_socios_dueno = self.client.get(
+                "/api/socios",
+                headers={"Authorization": f"Bearer {token_dueno1}"},
+            )
+            self.assertEqual(r_socios_dueno.status_code, 200)
+            soc_70 = next(s for s in r_socios_dueno.json()["socios"] if s["id_socio"] == 70)
+            self.assertEqual(soc_70["membresia_actual"]["id_membresia_socio"], sim_ms_id)
+
+        dashboard_socio_router.reset_demo_simulated_payments_store()
 
 
 if __name__ == "__main__":
