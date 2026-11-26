@@ -4,6 +4,11 @@ from fastapi import APIRouter, HTTPException, status, Depends, Query, Path
 from supabase import Client
 
 from app.core.dependencies import get_current_user, run_db_parallel
+from app.services.demo_payment_store import (
+    get_demo_pago_by_id,
+    merge_demo_membresias,
+    merge_demo_pagos,
+)
 from app.services.utils import get_data
 from app.models.pago import PagoCreate, PagoUpdateEstado
 from app.routers.socios import (
@@ -64,6 +69,8 @@ def _fetch_pago_or_404(db: Client, id_pago: int) -> Dict[str, Any]:
         .execute()
     )
     pago = get_data(res)
+    if not isinstance(pago, dict):
+        pago = get_demo_pago_by_id(id_pago)
     if not isinstance(pago, dict):
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Pago no encontrado.")
     return pago
@@ -136,9 +143,9 @@ async def get_mis_pagos(
         )
 
     res = db.from_("pago").select(PAGO_SELECT).order("fecha_pago", desc=True).execute()
-    rows = get_data(res)
+    rows = merge_demo_pagos(get_data(res) or [], gym_id=id_gimnasio, socio_id=own_socio_id)
     propios = [
-        p for p in (rows if isinstance(rows, list) else [])
+        p for p in rows
         if isinstance(p, dict)
         and _extract_socio_id_from_pago(p) == own_socio_id
         and (id_gimnasio is None or _extract_gym_id_from_pago(p) == id_gimnasio)
@@ -170,8 +177,9 @@ async def get_resumen_pagos(
         access_token,
         [lambda c: get_data(c.from_("pago").select(PAGO_SELECT).order("fecha_pago", desc=True).execute())],
     )
+    rows = merge_demo_pagos(rows if isinstance(rows, list) else [], gym_id=gym_id)
     pagos = _filter_pagos_by_gym_and_params(
-        rows if isinstance(rows, list) else [],
+        rows,
         gym_id=gym_id,
         desde=desde,
         hasta=hasta,
@@ -225,8 +233,9 @@ async def get_pagos_membresias(
             ),
         ],
     )
+    membs = merge_demo_membresias(membs if isinstance(membs, list) else [], gym_id=gym_id)
     membs_by_sg: Dict[int, List[Dict[str, Any]]] = {}
-    for m in (membs if isinstance(membs, list) else []):
+    for m in membs:
         if isinstance(m, dict) and int(m.get("id_gimnasio") or 0) == gym_id:
             sg_id = int(m.get("id_socio_gimnasio") or 0)
             membs_by_sg.setdefault(sg_id, []).append(m)
@@ -303,8 +312,9 @@ async def get_pagos(
         access_token,
         [lambda c: get_data(c.from_("pago").select(PAGO_SELECT).order("id_pago", desc=True).execute())],
     )
+    rows = merge_demo_pagos(rows if isinstance(rows, list) else [], gym_id=gym_id)
     filtrados = _filter_pagos_by_gym_and_params(
-        rows if isinstance(rows, list) else [],
+        rows,
         gym_id=gym_id,
         estado=estado,
         desde=desde,

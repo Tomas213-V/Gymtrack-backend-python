@@ -25,6 +25,8 @@ from app.models.socio import (
     SocioUpdatePerfil,
 )
 from app.routers.gimnasios import ensure_active_organizational_assignments
+from app.services.demo_payment_store import merge_demo_membresias
+from app.services.membresia_lifecycle import ESTADOS_DB_ACTIVOS
 
 router = APIRouter(prefix="/api/socios", tags=["Socios y Asociaciones Multi-Gimnasio"])
 
@@ -260,7 +262,9 @@ def _fetch_membresias_por_socio_gimnasio(
         return {}
 
     if not isinstance(rows, list):
-        return {}
+        rows = []
+
+    rows = merge_demo_membresias(rows, gym_id=id_gimnasio, sg_ids=sg_ids)
 
     allowed_sg = set(sg_ids)
     agrupadas: Dict[int, List[Dict[str, Any]]] = {}
@@ -277,6 +281,15 @@ def _fetch_membresias_por_socio_gimnasio(
     return {sg_id: _sort_membresias_para_socio(lista) for sg_id, lista in agrupadas.items()}
 
 
+def _resolver_estado_en_gimnasio(estado_asociacion: Any, estado_global: Any) -> bool:
+    """Resuelve el estado operativo efectivo de un socio dentro de un gimnasio."""
+    if estado_global is False:
+        return False
+    if estado_asociacion is not None:
+        return bool(estado_asociacion)
+    return bool(estado_global if estado_global is not None else True)
+
+
 def _format_socio_con_asociacion(
     sg_row: Dict[str, Any],
     membresias: Optional[List[Dict[str, Any]]] = None,
@@ -284,6 +297,10 @@ def _format_socio_con_asociacion(
     socio_clean = _clean_socio_dict(sg_row.get("socio"))
     if not socio_clean and sg_row.get("id_socio") is not None:
         socio_clean = {"id_socio": sg_row.get("id_socio")}
+    estado_global = socio_clean.get("estado")
+    estado_asociacion = sg_row.get("estado")
+    estado_en_gimnasio = _resolver_estado_en_gimnasio(estado_asociacion, estado_global)
+
     membs_list = membresias if isinstance(membresias, list) else []
     memb_actual = membs_list[0] if membs_list else None
     return {
@@ -291,7 +308,10 @@ def _format_socio_con_asociacion(
         "id_socio": socio_clean.get("id_socio") or sg_row.get("id_socio"),
         "id_socio_gimnasio": sg_row.get("id_socio_gimnasio"),
         "id_gimnasio_asociacion": sg_row.get("id_gimnasio"),
-        "estado_asociacion": sg_row.get("estado"),
+        "estado": estado_en_gimnasio,
+        "estado_asociacion": estado_asociacion,
+        "estado_global": estado_global,
+        "tiene_contrasena": bool(socio_clean.get("auth_user_id")),
         "fecha_alta_gimnasio": sg_row.get("fecha_alta"),
         "creado_en_asociacion": sg_row.get("creado_en"),
         "gimnasio": sg_row.get("gimnasio"),
@@ -654,10 +674,11 @@ async def get_socios(
     term = search.strip().lower() if search and search.strip() else None
 
     for sg in asociaciones:
-        if estado_bool is not None and bool(sg.get("estado")) is not estado_bool:
+        s_obj = sg.get("socio") if isinstance(sg.get("socio"), dict) else {}
+        sg_estado_efectivo = bool(sg.get("estado")) and (s_obj.get("estado") is not False)
+        if estado_bool is not None and sg_estado_efectivo is not estado_bool:
             continue
         if term:
-            s_obj = sg.get("socio") if isinstance(sg.get("socio"), dict) else {}
             haystack = " ".join(
                 str(s_obj.get(col) or "").lower()
                 for col in ("nombre", "apellido", "dni", "email", "telefono")
@@ -987,13 +1008,57 @@ async def _cambiar_estado_asociacion_logic(
     except Exception as exc:
         raise_http_from_postgrest_error(exc, "No fue posible actualizar el estado de la asociación socio_gimnasio")
 
+    membresias_desactivadas: List[int] = []
+    if not bool(nuevo_estado):
+        res_membs = (
+            staff_db.from_("membresia_socio")
+            .select("id_membresia_socio, id_socio_gimnasio, id_gimnasio, estado")
+            .eq("id_socio_gimnasio", id_socio_gimnasio)
+            .eq("id_gimnasio", gym_id)
+            .execute()
+        )
+        contratos = get_data(res_membs) or []
+        if isinstance(contratos, list):
+            for row in contratos:
+                if not isinstance(row, dict):
+                    continue
+                if int(row.get("id_socio_gimnasio") or 0) != id_socio_gimnasio or int(row.get("id_gimnasio") or 0) != gym_id:
+                    continue
+                mid = row.get("id_membresia_socio")
+                if mid is None:
+                    continue
+                est_raw = str(row.get("estado") or "").strip().lower()
+                if est_raw not in ESTADOS_DB_ACTIVOS:
+                    continue
+                mid_int = int(mid)
+                try:
+                    staff_db.rpc(
+                        "rpc_actualizar_estado_membresia",
+                        {
+                            "p_id_membresia_socio": mid_int,
+                            "p_estado": "cancelada",
+                            "p_fecha_vencimiento": None,
+                        },
+                    ).execute()
+                    membresias_desactivadas.append(mid_int)
+                except Exception as exc:
+                    raise_http_from_postgrest_error(
+                        exc,
+                        "El socio fue dado de baja, pero no fue posible desactivar su membresía activa",
+                    )
+
     return {
         "mensaje": (
             "Asociación socio-gimnasio activada exitosamente."
             if nuevo_estado
-            else "Asociación socio-gimnasio desactivada exitosamente conservando la identidad del socio."
+            else (
+                "Asociación socio-gimnasio y membresía(s) activa(s) desactivadas exitosamente conservando la identidad del socio."
+                if membresias_desactivadas
+                else "Asociación socio-gimnasio desactivada exitosamente conservando la identidad del socio."
+            )
         ),
         "socio_gimnasio": updated,
+        "membresias_desactivadas": membresias_desactivadas,
     }
 
 
@@ -1073,10 +1138,17 @@ async def get_socio_by_id(
         membresias_socio = membs_map.get(int(sg_id), [])
 
     membresia_actual = membresias_socio[0] if membresias_socio else None
+    estado_global = socio_clean.get("estado")
+    estado_asociacion = assoc.get("estado")
+    estado_en_gimnasio = _resolver_estado_en_gimnasio(estado_asociacion, estado_global)
+
     socio_con_membresia = {
         **socio_clean,
         "id_socio_gimnasio": sg_id,
-        "estado_asociacion": assoc.get("estado"),
+        "estado": estado_en_gimnasio,
+        "estado_asociacion": estado_asociacion,
+        "estado_global": estado_global,
+        "tiene_contrasena": bool(socio_clean.get("auth_user_id")),
         "fecha_alta_gimnasio": assoc.get("fecha_alta"),
         "membresia": membresias_socio,
         "membresias": membresias_socio,

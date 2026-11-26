@@ -1,10 +1,19 @@
 import time
-from datetime import date
+from datetime import date, datetime, timedelta, timezone
 from typing import Dict, Any, Optional, List
 from fastapi import APIRouter, HTTPException, status, Depends, Query, Request
 from supabase import Client
 
+import app.config as app_config
 from app.core.dependencies import get_current_user, run_db_parallel
+from app.services.demo_payment_store import (
+    list_demo_membresias_para,
+    merge_demo_membresias,
+    merge_demo_pagos,
+    next_demo_sim_ids,
+    registrar_demo_simulacion,
+    reset_demo_simulated_payments_store,
+)
 from app.services.utils import (
     formatear_precio_ars,
     calcular_metricas_membresia,
@@ -16,6 +25,7 @@ from app.models.dashboard_socio import (
     CheckinSocioRequest,
     SolicitarMembresiaSocio,
     IniciarPagoSocio,
+    SimularPagoMercadoPagoSocio,
 )
 from app.routers.socios import (
     _resolve_socio_profile_context,
@@ -24,11 +34,14 @@ from app.routers.socios import (
 from app.routers.planes_membresia import PLAN_COLUMNS
 from app.routers.membresias import (
     MEMBRESIA_SOCIO_SELECT,
+    _cancelar_activas_y_calcular_dias_restantes,
     _fetch_contratos_asociacion,
     _map_rpc_error_status,
 )
 from app.services.membresia_lifecycle import (
+    ESTADOS_DB_ACTIVOS,
     buscar_conflicto_superposicion,
+    calcular_dias_restantes_acumulados,
     calcular_inicio_encadenado,
     enriquecer_membresia_ciclo_vida,
     parse_iso_date,
@@ -51,6 +64,17 @@ from app.routers.rutinas import (
 )
 
 router = APIRouter(prefix="/api/socio", tags=["Panel Socio"])
+
+
+def _merge_demo_sim_state(
+    own_socio_id: int,
+    gym_id: Optional[int],
+    raw_m: List[Dict[str, Any]],
+    pagos: List[Dict[str, Any]],
+):
+    merged_m = merge_demo_membresias(raw_m, gym_id=gym_id)
+    merged_p = merge_demo_pagos(pagos, gym_id=gym_id, socio_id=own_socio_id)
+    return merged_m, merged_p
 
 
 def _select_active_gym_for_socio(
@@ -199,6 +223,7 @@ async def get_dashboard_socio(
             m for m in (raw_m_list if isinstance(raw_m_list, list) else [])
             if isinstance(m, dict) and int(m.get("id_socio_gimnasio") or 0) == selected_sg_id
         ]
+        raw_m, _ = _merge_demo_sim_state(own_socio_id, selected_gym_id, raw_m, [])
         membresia_actual, membresia_programada = seleccionar_membresia_vigente_y_programada(raw_m)
         rutinas_asignadas = [
             a for a in (raw_ra_list if isinstance(raw_ra_list, list) else [])
@@ -216,6 +241,7 @@ async def get_dashboard_socio(
         and _extract_socio_id_from_pago(p) == own_socio_id
         and (selected_gym_id is None or _extract_gym_id_from_pago(p) == selected_gym_id)
     ]
+    _, pagos_propios = _merge_demo_sim_state(own_socio_id, selected_gym_id, [], pagos_propios)
     ultimo_pago = pagos_propios[0] if pagos_propios else None
 
     # 3. Asistencias del socio (`public.asistencia_socio`, excluyendo anuladas)
@@ -370,8 +396,6 @@ async def get_mi_membresia(
         m for m in (get_data(res_m) or [])
         if isinstance(m, dict) and int(m.get("id_socio_gimnasio") or 0) == sg_id
     ]
-    membresia, membresia_programada = seleccionar_membresia_vigente_y_programada(raw_m)
-    historial_membresias = [enriquecer_membresia_ciclo_vida(m) for m in raw_m]
 
     res_pagos = db.from_("pago").select(PAGO_SELECT).order("fecha_pago", desc=True).execute()
     pagos = [
@@ -380,6 +404,11 @@ async def get_mi_membresia(
         and _extract_socio_id_from_pago(p) == own_socio_id
         and _extract_gym_id_from_pago(p) == gym_id
     ][:10]
+
+    raw_m, pagos = _merge_demo_sim_state(own_socio_id, gym_id, raw_m, pagos)
+    pagos = pagos[:10]
+    membresia, membresia_programada = seleccionar_membresia_vigente_y_programada(raw_m)
+    historial_membresias = [enriquecer_membresia_ciclo_vida(m) for m in raw_m]
 
     res_pl = (
         db.from_("membresia_gimnasio")
@@ -669,4 +698,224 @@ async def iniciar_pago(
         "orden": orden,
         "plan": plan,
         "socio": socio,
+    }
+
+
+@router.post("/pagos/simular-mercadopago", status_code=status.HTTP_201_CREATED)
+async def simular_pago_mercadopago(
+    req: SimularPagoMercadoPagoSocio,
+    current_user: Dict[str, Any] = Depends(get_current_user),
+):
+    """
+    Simula un pago aprobado con Mercado Pago para presentaciones/demos:
+    - Valida socio autenticado, asociación activa `socio_gimnasio` y plan vigente.
+    - Si el servidor tiene `SUPABASE_SERVICE_ROLE_KEY`, persiste la nueva membresía activa
+      y el pago aprobado (`metodo_pago='mercadopago'`) vía RPCs oficiales cancelando
+      membresías previas y transfiriendo días restantes.
+    - Si no hay `service_role` local, registra la simulación en memoria para el panel
+      del socio sin exponer claves ni simular sobre otros usuarios.
+    """
+    global _DEMO_SIM_SEQ
+
+    socio_ctx = _resolve_socio_profile_context(current_user)
+    own_socio_id = int(socio_ctx["id_socio"])
+    db: Client = socio_ctx["supabase"]
+
+    res_plan = (
+        db.from_("membresia_gimnasio")
+        .select(PLAN_COLUMNS)
+        .eq("id_membresia_gimnasio", req.id_membresia_gimnasio)
+        .maybe_single()
+        .execute()
+    )
+    plan = get_data(res_plan)
+    if not isinstance(plan, dict):
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Plan de membresía no encontrado.")
+    if plan.get("estado") is not True:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="El plan seleccionado está inactivo y no admite nuevos pagos.",
+        )
+
+    plan_gym_id = int(plan["id_gimnasio"])
+    asocs = _fetch_socio_gimnasios_for_socio(db, own_socio_id)
+    assoc = next(
+        (a for a in asocs if int(a.get("id_gimnasio") or 0) == plan_gym_id and a.get("estado") is True),
+        None,
+    )
+    if not assoc:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="No posees una asociación activa en el gimnasio de este plan.",
+        )
+
+    hoy = date.today()
+    fecha_inicio_efectiva = parse_iso_date(req.fecha_inicio) or hoy
+    sg_id = int(assoc["id_socio_gimnasio"])
+    duracion_plan = max(1, int(plan.get("duracion_dias") or 30))
+    precio_real = round(float(plan.get("precio") or 0), 2)
+    comprobante_sim = f"MP-SIM-{plan_gym_id}-{own_socio_id}-{int(time.time() * 1000)}"
+
+    if app_config.has_service_role():
+        admin_db = app_config.get_supabase_admin_client()
+        try:
+            membresias_previas_canceladas, dias_transferidos = _cancelar_activas_y_calcular_dias_restantes(
+                admin_db,
+                plan_gym_id,
+                sg_id,
+                hoy=hoy,
+            )
+            res_rpc = admin_db.rpc(
+                "rpc_contratar_membresia",
+                {
+                    "p_id_socio": own_socio_id,
+                    "p_id_membresia_gimnasio": req.id_membresia_gimnasio,
+                    "p_fecha_inicio": fecha_inicio_efectiva.isoformat(),
+                    "p_estado": "activa",
+                    "p_registrar_pago": True,
+                    "p_metodo_pago": "mercadopago",
+                    "p_estado_pago": "aprobado",
+                    "p_comprobante": comprobante_sim,
+                    "p_monto_override": None,
+                },
+            ).execute()
+            resultado = get_data(res_rpc)
+        except Exception as exc:
+            raise HTTPException(
+                status_code=_map_rpc_error_status(exc),
+                detail=f"No fue posible simular el pago con Mercado Pago: {exc}",
+            ) from exc
+
+        if not isinstance(resultado, dict):
+            raise HTTPException(
+                status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+                detail="Respuesta inválida de rpc_contratar_membresia.",
+            )
+
+        ms_res = resultado.get("membresia_socio")
+        if (
+            dias_transferidos > 0
+            and isinstance(ms_res, dict)
+            and ms_res.get("id_membresia_socio") is not None
+        ):
+            f_venc_base = parse_iso_date(ms_res.get("fecha_vencimiento")) or (
+                fecha_inicio_efectiva + timedelta(days=duracion_plan)
+            )
+            nueva_fecha_venc = (f_venc_base + timedelta(days=dias_transferidos)).isoformat()
+            try:
+                res_ext = admin_db.rpc(
+                    "rpc_actualizar_estado_membresia",
+                    {
+                        "p_id_membresia_socio": int(ms_res["id_membresia_socio"]),
+                        "p_estado": None,
+                        "p_fecha_vencimiento": nueva_fecha_venc,
+                    },
+                ).execute()
+                ms_ext = get_data(res_ext)
+                ms_res = ms_ext if isinstance(ms_ext, dict) else {**ms_res, "fecha_vencimiento": nueva_fecha_venc}
+            except Exception as exc:
+                raise HTTPException(
+                    status_code=_map_rpc_error_status(exc),
+                    detail=f"El pago se simuló pero no fue posible transferir {dias_transferidos} días previos: {exc}",
+                ) from exc
+
+        ms_enr = enriquecer_membresia_ciclo_vida(ms_res, hoy=hoy) if isinstance(ms_res, dict) else ms_res
+        return {
+            "mensaje": f"Pago con Mercado Pago simulado y acreditado. Tu plan {plan.get('nombre', '')} ya está activo.",
+            "modo": "mercadopago_simulado_bd",
+            "persistido_en_bd": True,
+            "id_gimnasio": plan_gym_id,
+            "membresia_socio": ms_enr,
+            "pago": resultado.get("pago"),
+            "dias_transferidos": dias_transferidos,
+            "membresias_previas_canceladas": membresias_previas_canceladas,
+        }
+
+    # Modo presentación sin service_role local: calcula días transferibles y registra estado compartido
+    contratos_db = _fetch_contratos_asociacion(db, sg_id, plan_gym_id)
+    contratos_demo = list_demo_membresias_para(gym_id=plan_gym_id, sg_id=sg_id)
+    contratos_previos = list(contratos_demo) + list(contratos_db)
+    dias_transferidos = calcular_dias_restantes_acumulados(contratos_previos, hoy=hoy)
+    membresias_previas_canceladas = [
+        int(c["id_membresia_socio"])
+        for c in contratos_previos
+        if isinstance(c, dict)
+        and c.get("id_membresia_socio") is not None
+        and str(c.get("estado") or "").strip().lower() in ESTADOS_DB_ACTIVOS
+    ]
+
+    sim_ms_id, sim_pago_id = next_demo_sim_ids()
+
+    assoc_con_socio = dict(assoc)
+    if not isinstance(assoc_con_socio.get("socio"), dict):
+        res_soc = (
+            db.from_("socio")
+            .select("id_socio, nombre, apellido, dni, email, telefono, estado")
+            .eq("id_socio", own_socio_id)
+            .maybe_single()
+            .execute()
+        )
+        assoc_con_socio["socio"] = get_data(res_soc) or socio_ctx.get("socio") or {"id_socio": own_socio_id}
+
+    fecha_venc = fecha_inicio_efectiva + timedelta(days=duracion_plan + dias_transferidos)
+    now_iso = datetime.now(timezone.utc).isoformat()
+    sim_ms = {
+        "id_membresia_socio": sim_ms_id,
+        "id_socio_gimnasio": sg_id,
+        "id_membresia_gimnasio": req.id_membresia_gimnasio,
+        "id_gimnasio": plan_gym_id,
+        "precio": precio_real,
+        "duracion_dias_contratados": duracion_plan,
+        "limite_asistencias_semanales": plan.get("limite_asistencias_semanales"),
+        "limite_asistencias_totales": plan.get("limite_asistencias_totales"),
+        "fecha_inicio": fecha_inicio_efectiva.isoformat(),
+        "fecha_vencimiento": fecha_venc.isoformat(),
+        "estado": "activa",
+        "creado_en": now_iso,
+        "membresia_gimnasio": plan,
+        "socio_gimnasio": assoc_con_socio,
+        "es_simulacion": True,
+    }
+    sim_pago = {
+        "id_pago": sim_pago_id,
+        "id_membresia_socio": sim_ms_id,
+        "monto": precio_real,
+        "fecha_pago": now_iso,
+        "metodo_pago": "mercadopago",
+        "estado": "aprobado",
+        "comprobante": comprobante_sim,
+        "plan_nombre": plan.get("nombre") or "Plan de Membresía",
+        "membresia_socio": {
+            "id_membresia_socio": sim_ms_id,
+            "id_socio_gimnasio": sg_id,
+            "id_membresia_gimnasio": req.id_membresia_gimnasio,
+            "id_gimnasio": plan_gym_id,
+            "precio": precio_real,
+            "fecha_inicio": fecha_inicio_efectiva.isoformat(),
+            "fecha_vencimiento": fecha_venc.isoformat(),
+            "estado": "activa",
+            "membresia_gimnasio": plan,
+            "socio_gimnasio": assoc_con_socio,
+        },
+        "es_simulacion": True,
+    }
+
+    registrar_demo_simulacion(
+        own_socio_id=own_socio_id,
+        plan_gym_id=plan_gym_id,
+        sg_id=sg_id,
+        sim_ms=sim_ms,
+        sim_pago=sim_pago,
+    )
+
+    ms_enr = enriquecer_membresia_ciclo_vida(sim_ms, hoy=hoy)
+    return {
+        "mensaje": f"Pago con Mercado Pago simulado y acreditado. Tu plan {plan.get('nombre', '')} ya está activo.",
+        "modo": "mercadopago_simulado_presentacion",
+        "persistido_en_bd": False,
+        "id_gimnasio": plan_gym_id,
+        "membresia_socio": ms_enr,
+        "pago": sim_pago,
+        "dias_transferidos": dias_transferidos,
+        "membresias_previas_canceladas": membresias_previas_canceladas,
     }
