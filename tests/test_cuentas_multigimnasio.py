@@ -855,6 +855,28 @@ class TestCuentasYAutenticacionMultiGimnasio(unittest.TestCase):
             self.assertEqual(r_rec.status_code, 200)
             self.assertEqual(self.fake_auth.reset_calls, ["inexistente@gymtrack.test"])
 
+            # Restablecer contraseña con token temporal de recuperación
+            r_reset_bad = self.client.post(
+                "/api/auth/restablecer-contrasena",
+                json={"nueva_contrasena": "ClaveNueva123!", "confirmar_contrasena": "ClaveNueva123!"},
+            )
+            self.assertEqual(r_reset_bad.status_code, 400)
+
+            with patch(
+                "app.routers.auth._update_supabase_auth_user_with_token",
+                return_value={"id": self.uid_dueno_1},
+            ):
+                r_reset_ok = self.client.post(
+                    "/api/auth/restablecer-contrasena",
+                    json={
+                        "access_token": "recovery-token-demo",
+                        "nueva_contrasena": "ClaveNueva123!",
+                        "confirmar_contrasena": "ClaveNueva123!",
+                    },
+                )
+                self.assertEqual(r_reset_ok.status_code, 200)
+                self.assertIn("restablecida", r_reset_ok.json()["mensaje"].lower())
+
         self._with_env(run)
 
     # ------------------------------------------------------------------

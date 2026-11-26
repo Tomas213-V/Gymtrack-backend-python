@@ -7,6 +7,7 @@ from supabase import Client
 from app.config import (
     SUPABASE_URL,
     SUPABASE_ANON_KEY,
+    FRONTEND_URL,
     supabase_anon,
     create_supabase_anon_client,
     create_supabase_client_for_token,
@@ -39,6 +40,7 @@ from app.models.auth import (
     UpdateOwnerProfileRequest,
     CambiarContrasenaRequest,
     RecuperarContrasenaRequest,
+    RestablecerContrasenaRequest,
     VerificarIdentidadRequest,
 )
 
@@ -1358,7 +1360,14 @@ async def recuperar_contrasena(req: RecuperarContrasenaRequest):
             detail="El formato del correo electrónico no es válido.",
         )
     try:
-        anon_client.auth.reset_password_for_email(clean_email)
+        redirect_url = f"{str(FRONTEND_URL or 'http://localhost:5173').rstrip('/')}/restablecer-contrasena"
+        try:
+            anon_client.auth.reset_password_for_email(
+                clean_email,
+                options={"redirect_to": redirect_url},
+            )
+        except TypeError:
+            anon_client.auth.reset_password_for_email(clean_email)
     except Exception:
         # Nunca revelar si el email existe o no en Supabase Auth
         pass
@@ -1367,6 +1376,76 @@ async def recuperar_contrasena(req: RecuperarContrasenaRequest):
             "Si existe una cuenta asociada a ese correo electrónico, recibirás un enlace "
             "de recuperación enviado por Supabase Auth."
         )
+    }
+
+
+@router.post("/restablecer-contrasena", status_code=status.HTTP_200_OK)
+async def restablecer_contrasena(req: RestablecerContrasenaRequest):
+    """
+    Completa el restablecimiento de contraseña utilizando el token temporal de recuperación
+    emitido por Supabase Auth en el enlace enviado por correo electrónico.
+    """
+    pass_limpia = req.nueva_contrasena.strip()
+    if len(pass_limpia) < 6:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="La nueva contraseña debe tener al menos 6 caracteres.",
+        )
+    if req.confirmar_contrasena is not None and req.confirmar_contrasena.strip() != pass_limpia:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="La confirmación de la contraseña no coincide con la nueva contraseña.",
+        )
+
+    recovery_token = str(req.access_token or "").strip()
+    token_hash = str(req.token_hash or "").strip()
+
+    if not recovery_token and token_hash:
+        try:
+            validate_supabase_configuration()
+            async with httpx.AsyncClient(timeout=15.0) as client:
+                verify_resp = await client.post(
+                    f"{SUPABASE_URL}/auth/v1/verify",
+                    headers={
+                        "apikey": SUPABASE_ANON_KEY,
+                        "Content-Type": "application/json",
+                    },
+                    json={
+                        "token_hash": token_hash,
+                        "type": req.type or "recovery",
+                    },
+                )
+            verify_body = verify_resp.json() if verify_resp.content else {}
+            if verify_resp.status_code >= 400:
+                msg = (
+                    verify_body.get("msg")
+                    or verify_body.get("message")
+                    or verify_body.get("error_description")
+                    or "El enlace de recuperación es inválido o expiró."
+                )
+                raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=msg)
+            recovery_token = str(verify_body.get("access_token") or "").strip()
+        except HTTPException:
+            raise
+        except Exception as exc:
+            raise HTTPException(
+                status_code=status.HTTP_502_BAD_GATEWAY,
+                detail=f"No se pudo verificar el enlace de recuperación: {exc}",
+            ) from exc
+
+    if not recovery_token:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="El enlace de recuperación no es válido o expiró. Solicitá uno nuevo desde el login.",
+        )
+
+    updated_user = await _update_supabase_auth_user_with_token(recovery_token, {"password": pass_limpia})
+    uid = updated_user.get("id")
+    if uid:
+        invalidate_user_context_cache(uid)
+
+    return {
+        "mensaje": "Contraseña restablecida correctamente. Ya podés iniciar sesión con tu nueva clave.",
     }
 
 

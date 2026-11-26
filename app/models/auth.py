@@ -62,6 +62,14 @@ class RecuperarContrasenaRequest(BaseModel):
     email: str = Field(..., min_length=3, max_length=254)
 
 
+class RestablecerContrasenaRequest(BaseModel):
+    access_token: Optional[str] = None
+    token_hash: Optional[str] = None
+    type: Optional[str] = "recovery"
+    nueva_contrasena: str = Field(..., min_length=6)
+    confirmar_contrasena: Optional[str] = None
+
+
 class VerificarIdentidadRequest(BaseModel):
     tipo_perfil: Literal["socio", "empleado", "administrador"]
     dni: Optional[str] = Field(default=None, max_length=20)
